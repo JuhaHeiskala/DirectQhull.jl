@@ -4,10 +4,8 @@ authors = ["Juha Heiskala <juha.t.heiskala@iki.fi>"]
 version = "0.1.0"
 
 [deps]
-DirectQhullHelper_jll = "af82f447-cd1e-5518-b874-3ab508da728e"
 Qhull_jll = "784f63db-0788-585a-bace-daefebcd302b"
 
 [compat]
-julia = "1.6"
 Qhull_jll = "2020.2.0"
-DirectQhullHelper_jll = "0.1.0"
+julia = "1.6"

@@ -1,3 +1,5 @@
+module DirectQHull
+
 # MIT License
 # 
 # Copyright (c) 2021 Juha Tapio Heiskala
@@ -20,755 +22,660 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-module DirectQhull
-
-import Base.getproperty
-import Base.setproperty!
-import Base.getindex
+# function "qh_get_extremes_2d" defined later licensed under BSD license from Scipy
 
 import Qhull_jll
-import DirectQhullHelper_jll
 
-const libqhull_r = Qhull_jll.get_libqhull_r_path()
-const libqhull_helper = DirectQhullHelper_jll.libDirectQhullHelper
+import Base.getproperty
+import Base.iterate
+import Base.getindex
 
 # define Qhull types
+
 QHboolT = Cuint
 QHrealT = Cdouble
-QHint = Cint
+QHcoordT = QHrealT
+QHpointT = QHcoordT
+QHintT = Cint 
 QHprintT = Cint
-QHchar = Cchar
-QHjmpbufT = Ptr{Cuchar}
-QHfileT = Cvoid
-QHuint = Cuint
-QHridgeT = Ptr{Cuchar}
-QHulong = Culong
+QHcharT = Cchar
+QHuintT = Cuint
+QHulongT = Culong
 QHcenterT = Cint
-QHdouble = Cdouble
-QHvoid = Cvoid
-QHmemT = Ptr{Cuchar}
-QHstatT = Ptr{Cuchar}
+QHdoubleT = Cdouble
+QHvoidT = Cvoid
+QHfileT = Cvoid
 
-# mutable structs for accessing Qhull internals
-mutable struct QHflagT
-    flag::Cuint
+
+mutable struct qhT
 end
 
-mutable struct QHqhT
-    qh::Vector{UInt8}
+# defines clockwise or counterclockwise orientation e.g. 2d-convex hull vertex ordering
+const qh_ORIENTclock = 0
+
+const qh_lib = Qhull_jll.get_libqhull_r_path()
+
+function qh_alloc_qh(err_file::Ptr{Cvoid}=C_NULL)
+    qh_ptr = ccall((:qh_alloc_qh, qh_lib), Ptr{qhT}, (Ptr{Cvoid},), err_file)    
+    (qh_ptr != C_NULL) ? qh_ptr : throw(ErrorException("qhT initialization failure."))
 end
 
-mutable struct QHfacetT
-    ptr::Ptr{Vector{UInt8}}
+# This should always be true
+@assert(sizeof(Ptr{Cvoid}) == sizeof(Int))
+
+abstract type QHsetelemT end
+
+# this is not an exact representation of QHull's set type
+# Qhull set is dynamically allocated so exact representation is not straighforward as Julia type.
+# (would require NTuple type for elements with tuple length equal to number elements in the list)
+# QH set element type is defined as union of void pointer and integer
+struct QHsetT{T<:Union{QHintT, Ptr{<:QHsetelemT}}}
+    maxsize::QHintT          # /* maximum number of elements (except NULL) */
+    e::Array{T}              # /* array of pointers, tail is NULL */
+                             # /* last slot (unless NULL) is actual size+1
+                             # /* e[maxsize]==NULL or e[e[maxsize]-1]==NULL */
+                             # /* this may generate a warning since e[] contains  maxsize elements */
+    function QHsetT{T}(ptr::Ptr{QHsetT{T}}) where T<:Ptr{<:QHsetelemT}
+        max_size = unsafe_load(Ptr{QHintT}(ptr))
+        # with passing C_NULL as qh_ptr below the call will crash, if the setsize is invalid
+        # however, qhull would exit in this case with internal error in a more gracious manner
+        set_size = qh_setsize(Ptr{qhT}(C_NULL), ptr)
+        # assumed here QHsetT field e is offset Ptr-size from the maxsize field
+        ptr_array = unsafe_wrap(Array, Ptr{T}(ptr+sizeof(Ptr)), set_size)
+        new(max_size, ptr_array)
+    end
 end
 
-mutable struct QHvertexT
-    ptr::Ptr{Vector{UInt8}}
+function Base.getindex(set::QHsetT{T}, idx::Int) where T<:Union{QHintT, Ptr{<:QHsetelemT}}
+    ptr = set.e[idx]
+    unsafe_load(ptr)
 end
 
-mutable struct QHpointT
-    ptr::Ptr{Vector{QHrealT}}
+
+# Qhull vertex type
+mutable struct QHvertexT{HD} <: QHsetelemT
+    next::Ptr{QHvertexT{HD}}                # /* next vertex in vertex_list or vertex_tail */
+    previous::Ptr{QHvertexT{HD}}            # /* previous vertex in vertex_list or NULL, for C++ interface */
+    point::Ptr{NTuple{HD, QHpointT}}        # /* hull_dim coordinates (coordT) */
+    neighbors::Ptr{QHsetT{<:QHsetelemT}}    # /* neighboring facets of vertex, qh_vertexneighbors()
+                                            # initialized in io_r.c or after first merge
+                              # qh_update_vertices for qh_addpoint or qh_triangulate
+                              # updated by merges
+                              # qh_order_vertexneighbors by 2-d (orientation) 3-d (adjacency), n-d (f.visitid,id) */
+    id::QHuintT               # /* unique identifier, 1..qh.vertex_id,  0 for sentinel, printed as 'r%d' */
+    visitid::QHuintT          # /* for use with qh.vertex_visit, size must match */
+    flags::QHcharT
+    # seen:1;      /* used to perform operations only once */
+    #flagT    seen2:1;     /* another seen flag */
+    #flagT    deleted:1;   /* vertex will be deleted via qh.del_vertices */
+    #flagT    delridge:1;  /* vertex belonged to a deleted ridge, cleared by qh_reducevertices */
+    #flagT    newfacet:1;  /* true if vertex is in a new facet
+    #                       vertex is on qh.newvertex_list and it has a facet on qh.newfacet_list
+    #                       or vertex is on qh.newvertex_list due to qh_newvertices while merging
+    #                       cleared by qh_resetlists */
+    #flagT    partitioned:1; /* true if deleted vertex has been partitioned */
 end
 
-mutable struct QHcoordT
-    ptr::Ptr{Vector{QHrealT}}
+# Qhull facet type
+mutable struct QHfacetT{HD} <: QHsetelemT
+    furthestdist::QHcoordT  # distance to furthest point of outsideset
+    maxoutside::QHcoordT    # max computed distance of point to facet
+                            # Before QHULLfinished this is an approximation
+                            # since maxdist not always set for qh_mergefacet
+                            # Actual outer plane is +DISTround and
+                            # computed outer plane is +2*DISTround.
+                            # Initial maxoutside is qh.DISTround, otherwise distance tests need to account for DISTround */
+
+    offset::QHcoordT        # exact offset of hyperplane from origin 
+    normal::Ptr{NTuple{HD, QHcoordT}}   # normal of hyperplane, hull_dim coefficients 
+                            # if f.tricoplanar, shared with a neighbor
+
+    #union {                # in order of testing */
+    area::QHrealT           # area of facet, only in io_r.c if  f.isarea */
+    #facetT *replace    # replacement facet for qh.NEWfacets with f.visible
+                            # NULL if qh_mergedegen_redundant, interior, or !NEWfacets */
+                            # facetT *samecycle;   /* cycle of facets from the same visible/horizon intersection,
+                            # if ->newfacet */
+    # facetT *newcycle;    /*  in horizon facet, current samecycle of new facets */
+    # facetT *trivisible;  /* visible facet for ->tricoplanar facets during qh_triangulate() */
+    # facetT *triowner;    /* owner facet for ->tricoplanar, !isarea facets w/ ->keepcentrum */
+    # }f;
+    center::Ptr{QHcoordT}  # set according to qh.CENTERtype */
+                           # qh_ASnone:    no center (not MERGING) */
+                           # qh_AScentrum: centrum for testing convexity (qh_getcentrum) */
+                           #               assumed qh_AScentrum while merging */
+                           # qh_ASvoronoi: Voronoi center (qh_facetcenter) */
+                           # after constructing the hull, it may be changed (qh_clearcenter) */
+                           # if tricoplanar and !keepcentrum, shared with a neighbor */
+    previous::Ptr{QHfacetT{HD}} # previous facet in the facet_list or NULL, for C++ interface */
+    next::Ptr{QHfacetT{HD}}     # next facet in the facet_list or facet_tail */
+    vertices::Ptr{QHsetT{Ptr{QHvertexT{HD}}}}   # vertices for this facet, inverse sorted by ID
+                            # if simplicial, 1st vertex was apex/furthest
+                            # qh_reduce_vertices removes extraneous vertices via qh_remove_extravertices
+                            # if f.visible, vertices may be on qh.del_vertices */
+    ridges::Ptr{QHsetT}     # explicit ridges for nonsimplicial facets or nonsimplicial neighbors.
+                            # For simplicial facets, neighbors define the ridges
+                            # qh_makeridges() converts simplicial facets by creating ridges prior to merging
+                            # If qh.NEWtentative, new facets have horizon ridge, but not vice versa
+                            # if f.visible && qh.NEWfacets, ridges is empty */
+    neighbors::Ptr{QHsetT{Ptr{QHfacetT{HD}}}}  # neighbors of the facet.  Neighbors may be f.visible
+                            # If simplicial, the kth neighbor is opposite the kth vertex and the
+                            # first neighbor is the horizon facet for the first vertex.
+                            # dupridges marked by qh_DUPLICATEridge (0x01) and qh_MERGEridge (0x02)
+                            # if f.visible && qh.NEWfacets, neighbors is empty */
+    outsideset::Ptr{QHsetT} # set of points outside this facet
+                            # if non-empty, last point is furthest
+                            # if NARROWhull, includes coplanars (less than qh.MINoutside) for partitioning*/
+    coplanarset::Ptr{QHsetT} # set of points coplanar with this facet
+                             # >= qh.min_vertex and <= facet->max_outside
+                             # a point is assigned to the furthest facet
+                             # if non-empty, last point is furthest away */
+    visitid::QHuintT         # visit_id, for visiting all neighbors, all uses are independent */
+    id::QHuintT              # unique identifier from qh.facet_id, 1..qh.facet_id, 0 is sentinel, printed as 'f%d' */
+    flags::QHuintT
+
+    # unsigned int nummerge:9; /* number of merges */
+    # define qh_MAXnummerge 511 /* 2^9-1 */
+    #                        /* 23 flags (at most 23 due to nummerge), printed by "flags:" in io_r.c */
+    # flagT    tricoplanar:1; /* True if TRIangulate and simplicial and coplanar with a neighbor */
+    #                      /*   all tricoplanars share the same apex */
+    #                      /*   all tricoplanars share the same ->center, ->normal, ->offset, ->maxoutside */
+    #                      /*     ->keepcentrum is true for the owner.  It has the ->coplanareset */
+    #                      /*   if ->degenerate, does not span facet (one logical ridge) */
+    #                      /*   during qh_triangulate, f.trivisible points to original facet */
+    # flagT    newfacet:1;  /* True if facet on qh.newfacet_list (new/qh.first_newfacet or merged) */
+    # flagT    visible:1;   /* True if visible facet (will be deleted) */
+    # flagT    toporient:1; /* True if created with top orientation
+    #                       after merging, use ridge orientation */
+    # flagT    simplicial:1;/* True if simplicial facet, ->ridges may be implicit */
+    # flagT    seen:1;      /* used to perform operations only once, like visitid */
+    # flagT    seen2:1;     /* used to perform operations only once, like visitid */
+    # flagT    flipped:1;   /* True if facet is flipped */
+    # flagT    upperdelaunay:1; /* True if facet is upper envelope of Delaunay triangulation */
+    # flagT    notfurthest:1; /* True if last point of outsideset is not furthest */
+    #
+    # /*-------- flags primarily for output ---------*/
+    # flagT    good:1;      /* True if a facet marked good for output */
+    # flagT    isarea:1;    /* True if facet->f.area is defined */
+
+    # /*-------- flags for merging ------------------*/
+    # flagT    dupridge:1;  /* True if facet has one or more dupridge in a new facet (qh_matchneighbor),
+    #                         a dupridge has a subridge shared by more than one new facet */
+    # flagT    mergeridge:1; /* True if facet or neighbor has a qh_MERGEridge (qh_mark_dupridges)
+    #                        ->normal defined for mergeridge and mergeridge2 */
+    # flagT    mergeridge2:1; /* True if neighbor has a qh_MERGEridge (qh_mark_dupridges) */
+    # flagT    coplanarhorizon:1;  /* True if horizon facet is coplanar at last use */
+    # flagT     mergehorizon:1; /* True if will merge into horizon (its first neighbor w/ f.coplanarhorizon). */
+    # flagT     cycledone:1;/* True if mergecycle_all already done */
+    # flagT    tested:1;    /* True if facet convexity has been tested (false after merge */
+    # flagT    keepcentrum:1; /* True if keep old centrum after a merge, or marks owner for ->tricoplanar
+    #                          Set by qh_updatetested if more than qh_MAXnewcentrum extra vertices
+    #                          Set by qh_mergefacet if |maxdist| > qh.WIDEfacet */
+    # flagT    newmerge:1;  /* True if facet is newly merged for reducevertices */
+    # flagT    degenerate:1; /* True if facet is degenerate (degen_mergeset or ->tricoplanar) */
+    # flagT    redundant:1;  /* True if facet is redundant (degen_mergeset)
+    #                     Maybe merge degenerate and redundant to gain another flag */
 end
 
-mutable struct QHsetT{T<:Union{QHvertexT, QHfacetT}}
-    ptr::Ptr{Vector{UInt8}}
+
+# Iteration for facet list
+function iterate(first_fct::QHfacetT{HD}) where HD
+    return (first_fct, first_fct.next_ptr)    
 end
 
-# retrieve "struct qhT" c-struct size in bytes (used to reserve memory when accessing Qhull directly)
-function qh_qhT_size()
-    ccall((:jl_qhull_qhT_size, libqhull_helper), Csize_t,
-          (),)
+function iterate(first_fct::QHfacetT{HD}, next_fct_ptr::Ptr{QHfacetT{HD}}) where HD
+    next_fct = unsafe_load(next_fct_ptr)
+    ## ID=0 is dummy facet that indicates end of the list
+    if next_fct.id == QHuintT(0)
+        return nothing
+    else
+        return (next_fct, next_fct.next_ptr)
+    end
 end
 
-# retrieve "struct facetT" c-struct size in bytes (used to reserve memory when accessing Qhull directly)
-function qh_facetT_size()
-    ccall((:jl_qhull_facetT_size, libqhull_helper), Csize_t,
-          (),)
+# Iteration for vertex list
+function iterate(first_vtx::QHvertexT{HD}) where HD
+    return (first_vtx, first_vtx.next_ptr)    
 end
 
-# zero "struct qhT", 
-function qh_zero(qh::QHqhT)
-    ccall((:qh_zero, libqhull_r), Cvoid,
-          (Ptr{Vector{UInt8}}, Ptr{Cvoid}),
-          pointer(qh.qh), C_NULL)
+function iterate(first_vtx::QHvertexT{HD}, next_vtx_ptr::Ptr{QHvertexT{HD}}) where HD
+    next_vtx = unsafe_load(next_vtx_ptr)
+    ## ID=0 is dummy vertext that indicates end of the list
+    if next_vtx.id == QHuintT(0)
+        return nothing
+    else
+        return (next_vtx, next_vtx.next_ptr)
+    end
 end
 
-# reserve memory for accessing Qhull directly
-function qh_init()
-    QHqhT(Vector{UInt8}(undef, qh_qhT_size()))
+
+# Iterate QHsetT with pointer types
+function iterate(set::QHsetT{T}) where T<:Ptr{<:QHsetelemT}
+
+    if length(set.e) == 0
+        return nothing
+    else
+        return (unsafe_load(set.e[1]), 2)
+    end
+end
+
+function iterate(set::QHsetT{T}, idx::Int) where T<:Ptr{<:QHsetelemT}
+    if idx > length(set.e)
+        return nothing
+    else
+        return (unsafe_load(set.e[idx]), idx+1)
+    end
+end
+
+
+# Build convex hull from a set points
+struct ConvexHull
+    qh_ptr::Ptr{qhT}
+    points::Matrix{QHcoordT}
+    vertices::Vector{QHuintT}
+    simplices::Matrix{QHuintT}
+    area::QHrealT
+    volume::QHrealT
+    max_bound::Vector{QHrealT}
+    min_bound::Vector{QHrealT}
+    
+    function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{AbstractString}=Vector{AbstractString}())
+        qh_ptr = qh_alloc_qh()
+
+        pushfirst!(qhull_options, "Qt")
+        
+        if size(pnts, 2)>=5
+            push!(qhull_options, "Qx")
+        end
+
+        # make options string
+        qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
+
+        # calculate new qhull
+        res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
+
+        
+        hd = qh_get_hull_dim(qh_ptr)
+
+        if hd == 2
+            vertices = qh_get_extremes_2d(qh_ptr)
+        else
+            vertices = unique((vtx)->qh_pointid(qh_ptr, vtx.point_ptr)+1)
+        end
+        
+        # collect convex hull points
+        # for some reason using hd from above in Val(hd) crashes Julia
+        simplices = qh_get_convex_hull_pnts(qh_ptr, Val(size(pnts,1)))
+
+        # calculate total area and volume
+        qh_getarea(qh_ptr, Val(size(pnts,1)))
+        area = qh_get_totarea(qh_ptr)
+        vol = qh_get_totvol(qh_ptr)
+
+        # max and min bounds
+        max_bound = maximum(pnts, dims=2)[:]
+        min_bound = minimum(pnts, dims=2)[:]
+
+        # the new Qhull value
+        new(qh_ptr, pnts, vertices, simplices, area, vol, max_bound, min_bound)
+    end    
 end
 
 # calculate new convex hull from the given points and Qhull options
-function qh_new_qhull(qh::QHqhT, pnts::StridedMatrix{Float64}, opts::String)
-    ok = ccall((:qh_new_qhull, libqhull_r), Cint,
-          (Ptr{Vector{UInt8}}, Cint, Cint, Ptr{QHcoordT}, QHboolT, Ptr{QHchar}, Ptr{QHfileT}, Ptr{QHfileT}),
-               pointer(qh.qh), size(pnts,1), size(pnts,2), pointer(pnts), false, "qhull  " * opts, C_NULL, C_NULL)
+function qh_new_qhull(qh::Ptr{qhT}, pnts::StridedMatrix{Float64}, opts::String)
+    ok = ccall((:qh_new_qhull, qh_lib), Cint,
+               (Ptr{qhT}, Cint, Cint, Ref{QHcoordT}, QHboolT, Ptr{QHcharT}, Ptr{QHfileT}, Ptr{QHfileT}),
+               qh, size(pnts, 1), size(pnts, 2), pnts, false, "qhull " * opts, C_NULL, C_NULL)
     
     return ok
 end
 
+function qh_triangulate(qh::Ptr{qhT})
+    ccall((:qh_triangulate, qh_lib), Cvoid, (Ptr{qhT},), qh)
+end
+
+function qh_getarea(qh::Ptr{qhT}, ::Val{HD}) where HD
+    ccall((:qh_getarea, qh_lib), Cvoid, (Ptr{qhT}, Ptr{QHfacetT}), qh, qh_get_facet_list_ptr(qh, Val(HD)))
+end
+    
 # retrieve Qhull internal point id
-function qh_point_id(qh::QHqhT, pnt::QHpointT)
-    ok = ccall((:qh_pointid, libqhull_r), Cint,
-          (Ptr{Vector{UInt8}}, Ptr{Vector{UInt8}}),
-          pointer(qh.qh), pnt.ptr)
-    return ok
+function qh_pointid(qh::Ptr{qhT}, pnt::Ptr{NTuple{N, QHpointT}}) where N
+    id = ccall((:qh_pointid, qh_lib), Cuint,
+               (Ptr{qhT}, Ptr{QHpointT}), qh, pnt)
+    return id
 end
 
-# call Qhull findgood_all 
-function qh_findgood_all(qh::QHqhT)
-    ccall((:qh_findgood_all, libqhull_r), Cvoid,
-          (Ptr{Vector{UInt8}}, Ptr{Vector{UInt8}}),
-          pointer(qh.qh), qh.facet_list.ptr)
+# retrieve Qhull set size
+function qh_setsize(qh::Ptr{qhT}, set::Ptr{QHsetT{T}}) where T<:Union{QHintT, Ptr{<:QHsetelemT}}
+    ccall((:qh_setsize, qh_lib), Cint, (Ptr{qhT}, Ptr{QHsetT}), qh, set)
 end
 
-# call Qhull setsize
-function qh_setsize(qh::QHqhT, set::QHsetT)
-    ccall((:qh_setsize, libqhull_r), Cint,
-          (Ptr{Vector{UInt8}}, Ptr{Vector{UInt8}}),
-          pointer(qh.qh), set.ptr)
+
+# GETTER accessors for plain data types
+for (T, getter) in ((:QHintT, :qh_get_hull_dim), (:QHintT, :qh_get_num_facets), (:QHintT, :qh_get_num_points),
+                    (:QHintT, :qh_get_num_vertices), (:QHintT, :qh_get_visit_id), (:QHintT, :qh_get_vertex_visit),
+                    (:QHrealT, :qh_get_totarea), (:QHrealT, :qh_get_totvol))
+    @eval begin
+        function ($getter)(qh::Ptr{qhT})
+            ccall(($(QuoteNode(getter)), qh_lib), $T, (Ptr{qhT},), qh)
+        end
+    end
 end
 
-# call Qhull setvoronoi_all
-function qh_setvoronoi_all(qh::QHqhT)
-    ccall((:qh_setvoronoi_all, libqhull_r), Cvoid,
-          (Ptr{Vector{UInt8}},),
-          pointer(qh.qh))
+# GETTER for facet list pointer
+function qh_get_facet_list_ptr(qh::Ptr{qhT}, ::Val{N}) where N
+    ccall((:qh_get_facet_list, qh_lib), Ptr{QHfacetT{N}}, (Ptr{qhT},), qh)
 end
 
-# call Qhull order vertexneighbours
-function qh_order_vertexneighbors(qh::QHqhT, vtx::QHvertexT)
-    ccall((:qh_order_vertexneighbors, libqhull_r), Cvoid,
-          (Ptr{Vector{UInt8}},Ptr{Vector{UInt8}}),
-          pointer(qh.qh), vtx.ptr)
+# GETTER for facet list as Julia QHfacetT type
+@noinline function qh_get_facet_list(qh::Ptr{qhT}, ::Val{N}) where N
+    local ptr
+
+    # this is workaround for Julia crashes that seem to happen if Val(N) has N defined in runtime
+    if N==1
+        ptr = qh_get_facet_list_ptr(qh, Val(1))
+    elseif N==2        
+        ptr = qh_get_facet_list_ptr(qh, Val(2))
+    elseif N==3
+        ptr = qh_get_facet_list_ptr(qh, Val(3))
+    elseif N==4
+        ptr = qh_get_facet_list_ptr(qh, Val(4))
+    elseif N==5
+        ptr = qh_get_facet_list_ptr(qh, Val(5))
+    else
+        error("Too large hull dimension")
+    end
+
+    if ptr != C_NULL
+        return unsafe_load(ptr)
+    else
+        return nothing
+    end        
+end
+
+# GETTER for facet list pointer
+function qh_get_vertex_list_ptr(qh::Ptr{qhT}, ::Val{N}) where N
+    ccall((:qh_get_vertex_list, qh_lib), Ptr{QHvertexT{N}}, (Ptr{qhT},), qh)
+end
+
+# GETTER for facet list as Julia QHfacetT type
+@noinline function qh_get_vertex_list(qh::Ptr{qhT}, ::Val{N}) where N
+    local ptr
+    # this is workaround for Julia crashes that seem to happen if Val(N) has N defined in runtime
+    if N==1
+        ptr = qh_get_vertex_list_ptr(qh, Val(1))
+    elseif N==2        
+        ptr = qh_get_vertex_list_ptr(qh, Val(2))
+    elseif N==3
+        ptr = qh_get_vertex_list_ptr(qh, Val(3))
+    elseif N==4
+        ptr = qh_get_vertex_list_ptr(qh, Val(4))
+    elseif N==5
+        ptr = qh_get_vertex_list_ptr(qh, Val(5))
+    else
+        error("Too large hull dimension")
+    end
+    if ptr != C_NULL
+        return unsafe_load(ptr)
+    else
+        return nothing
+    end        
+end
+
+
+function Base.getproperty(qh::ConvexHull, fld::Symbol)
+    if fld === :hull_dim
+        return qh_get_hull_dim(qh.qh_ptr)
+    elseif fld === :num_facets
+        return qh_get_num_facets(qh.qh_ptr)
+    elseif fld === :num_points
+        return qh_get_num_points(qh.qh_ptr)
+    elseif fld === :num_vertices
+        return qh_get_num_vertices(qh.qh_ptr)
+    elseif fld === :visit_id
+        return qh_get_visit_id(qh.qh_ptr)
+    elseif fld === :vertex_visit
+        return qh_get_vertex_visit(qh.qh_ptr)
+    elseif fld === :facet_list
+        # Hull dimension given to facet type so that hull dimension array size is known
+        return qh_get_facet_list(qh.qh_ptr, Val(qh.hull_dim))
+    elseif fld === :vertex_list
+        # Hull dimension given to facet type so that hull dimension array size is known
+        return qh_get_vertex_list(qh.qh_ptr, Val(qh.hull_dim))
+    else
+        return getfield(qh, fld)
+    end
+end
+
+function Base.getproperty(fct::QHfacetT{HD}, fld::Symbol) where HD
+    if fld === :next
+        ptr = getfield(fct, :next)
+        if ptr == C_NULL
+            return nothing
+        else
+            return unsafe_load(ptr)
+        end
+    elseif fld === :next_ptr
+        return getfield(fct, :next)
+    elseif fld === :vertices
+        return QHsetT{Ptr{QHvertexT{HD}}}(fct.vertices_ptr)
+    elseif fld === :vertices_ptr
+        return getfield(fct, :vertices)
+    elseif fld === :neighbors
+        return QHsetT{Ptr{QHfacetT{HD}}}(fct.neighbors_ptr)
+    elseif fld === :neighbors_ptr
+        return getfield(fct, :neighbors)
+    elseif fld == :toporient
+        return QHboolT( (getfield(fct, :flags)>>12)&1)  # toporient is 13th bit in the flags field
+    else
+        return getfield(fct, fld)
+    end
+end
+
+
+function Base.setproperty!(fct::QHfacetT{HD}, fld::Symbol, value) where HD
+    setfield!(fct, fld, value)
+    # store back to qhull, pointer to self is obtained (somewhat dangerously) utilizing the facet linked list
+    if (fct.id != 0) # ID=0 is dummy facet, with next=C_NULL (so the facet cannot be updated in this case)
+        unsafe_store!(fct.next.previous, fct)
+    end
+    return value
+end
+
+
+
+function Base.getproperty(vtx::QHvertexT, fld::Symbol)
+    if fld === :next
+        ptr = getfield(vtx, :next)
+        if ptr == C_NULL
+            return nothing
+        else
+            return unsafe_load(ptr)
+        end
+    elseif fld === :next_ptr
+        return getfield(vtx, :next)
+    elseif fld === :point
+        ptr = getfield(vtx, :point)
+        if ptr == C_NULL
+            return nothing
+        else
+            return unsafe_load(ptr)
+        end
+    elseif fld === :point_ptr
+        return getfield(vtx, :point)
+    else
+        return getfield(vtx, fld)
+    end
+end
+
+function Base.setproperty!(vtx::QHvertexT{HD}, fld::Symbol, value) where HD
+    setfield!(vtx, fld, value)
+    # store back to qhull, pointer to self is obtained (somewhat dangerously) utilizing the vertex linked list
+    if (vtx.id != 0) # ID=0 is dummy vertex, with next=C_NULL (so the vertex cannot be updated in this case)
+        unsafe_store!(vtx.next.previous, vtx)
+    end
 end
 
 # get calculated convex hull points as Julia Int Array
-function qh_get_convex_hull_pnts(qh::QHqhT)
-    n_vtx = qh.num_vertices
-    n_facets = qh.num_facets
-    facet = qh.facet_list
+function qh_get_convex_hull_pnts(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
+    n_facets = qh_get_num_facets(qh_ptr)
+    
+    facet_list = qh_get_facet_list(qh_ptr, Val(HD))
 
-    hull_dim = qh.hull_dim 
-
-    pnts = Array{Int,2}(undef, n_facets, hull_dim)
-    vtxSet = facet.vertices
-    pnt_ix = 1
-    for facetI=1:n_facets
+    # convex hull point ids (i.e. indexes to input points to qhull)
+    pnts = Matrix{QHuintT}(undef, HD, n_facets)
+    
+    facet_ix = 1
+    for facet in facet_list
         vtxSet = facet.vertices
-        vtxI = 1
-        while vtxI <= vtxSet.maxsize && vtxSet[vtxI].ptr != C_NULL                                
-            pnt_id = qh_point_id(qh, vtxSet[vtxI].point)
-            pnts[pnt_ix, vtxI] = pnt_id
-            vtxI += 1
-        end
-        pnt_ix += 1
-        facet = facet.next
-    end
 
+        vtx_ix = 1
+        for vtx in vtxSet            
+            pnt_id = qh_pointid(qh_ptr, vtx.point_ptr)
+
+            # +1 to change to 1-based index for Julia from C 0-based index
+            pnts[vtx_ix, facet_ix] = pnt_id + 1 
+            vtx_ix+=1
+        end
+        facet_ix+=1
+    end
+    
     return pnts
 end
 
-# get calculated dalaunay points as Julia Int Array
-function qh_get_delaunay_pnts(qh::QHqhT)
-    n_vtx = qh.num_vertices
-    n_facets = 0
-    facet = qh.facet_list
+# get calculated convex hull vertices as Julia Int Array
+function qh_get_convex_hull_vertices(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
+    n_vertices = qh_get_num_vertices(qh_ptr)
 
-    for facetI=1:qh.num_facets
-        if facet.upperdelaunay  == 0
-            n_facets += 1
-        end
-        facet = facet.next
+    vertex_list = qh_get_vertex_list(qh_ptr, Val(HD))
+
+    # convex hull point ids (i.e. indexes to input points to qhull)
+    vertices = Vector{QHuintT}(undef, n_vertices)
+    
+    vertex_ix = 1
+    for vtx in vertex_list
+        pnt_id = qh_pointid(qh_ptr, vtx.point_ptr)
+        vertices[vertex_ix] = pnt_id + 1
+        vertex_ix+=1
     end
     
-    hull_dim = qh.hull_dim 
-
-    pnts = Array{Int,2}(undef, n_facets, hull_dim)
-    vtxSet = facet.vertices
-    facet = qh.facet_list
-    pnt_ix = 1
-    for facetI=1:qh.num_facets
-        if facet.upperdelaunay  == 0
-            vtxSet = facet.vertices
-            vtxI = 1
-            while vtxI <= vtxSet.maxsize && vtxSet[vtxI].ptr != C_NULL                                
-                pnt_id = qh_point_id(qh, vtxSet[vtxI].point)
-                pnts[pnt_ix, vtxI] = pnt_id
-                vtxI += 1
-            end
-            pnt_ix += 1
-        end
-        facet = facet.next
-    end
-
-    return pnts
+    return vertices
 end
 
-# get calculated voroin points as Julia array
-function qh_get_voronoi_pnts(qh::QHqhT)
 
-    qh_findgood_all(qh)
+# Below function "qh_get_extremes_2d" adapted from from Qhull/io.c and
+# Scipy/_qhull.pyx/get_extremes_2d with the below license from _qhull.pyx/Scipy
+#
+# Copyright (C)  Pauli Virtanen, 2010.
+#
+# Distributed under the same BSD license as Scipy.
+#
+# 
+# Copyright (c) 2001-2002 Enthought, Inc.  2003-2019, SciPy Developers.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above
+#   copyright notice, this list of conditions and the following
+#   disclaimer in the documentation and/or other materials provided
+#   with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#   contributors may be used to endorse or promote products derived
+#   from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 
-    num_voronoi_regions = qh.num_vertices - qh_setsize(qh, qh.del_vertices)
 
-    num_voronoi_vertices = qh.num_good
+function qh_get_extremes_2d(qh_ptr::Ptr{qhT}) 
+
+    # qhull io.c has the below call, Scipy does not
+    # This is called from ConvexHull constructor, hence assumed visit_id is valid
+    # qh_countfacets(facetlist, facets, printall, &numfacets, &numsimplicial,
+    #    &totneighbors, &numridges, &numcoplanars, &numtricoplanars); /* marks qh visit_id */
+    # vertices= qh_facetvertices(facetlist, facets, printall);
+    # qh_fprintf(fp, 9088, "%d\n", qh_setsize(vertices));
+    # qh_settempfree(&vertices);
     
-    qh_setvoronoi_all(qh)
-
-    facet = qh.facet_list
-    while facet.ptr != qh.facet_tail.ptr
-       # facet.seen = false
-        facet = facet.next
+    if (qh_get_num_facets(qh_ptr) == 0)
+        return Vector{QHintT}()
     end
+    
+    # qhull/Scipy update the internal qhT structure fields for the visit ids
+    # as the values are only read in the rest of the code, local variables used here
+    # (assumed the qh internal value update is not necessary)
+    qh_vertex_visit = qh_get_vertex_visit(qh_ptr) + 1
+    qh_visit_id = qh_get_visit_id(qh_ptr) + 1
 
-    ni = zeros(Int, num_voronoi_regions)
+    # Init result array
+    extremes = zeros(QHintT, 100)
+    n_extremes = 0
 
-    k = 1
-    vertex = qh.vertex_list
-    while vertex.ptr != qh.vertex_tail.ptr
-        if qh.hull_dim == 3
-            qh_order_vertexneighbors(qh, vertex)
+    # get first facet in facet list
+    facet = qh_get_facet_list(qh_ptr, Val(qh_get_hull_dim(qh_ptr)))
+
+    # use facet id instead of pointer comparision for ending the while loop
+    start_facet_id = facet.id
+
+    while !isnothing(facet)
+        if facet.visitid == qh_visit_id
+            throw(ErrorException("Internal Qhull error, loop in facet list"))
         end
         
-        infinity_seen = false
-
-        neighborSet = vertex.neighbors
-        for neighborI = 1:qh_setsize(qh, neighborSet)
-            neighbor = neighborSet[neighborI]
-            if neighbor.upperdelaunay  != 0
-                if infinity_seen == false
-                    infinity_seen = true
-                    ni[k] += 1
-                end
-            else
-             #   neighbor.seen = true
-                ni[k] += 1
-            end
-        end
-        k += 1
-        vertex = vertex.next
-    end
-
-    nr = (qh.num_points > num_voronoi_regions) ? qh.num_points : num_voronoi_regions
-
-    at_inf = zeros(Bool, nr, 1)
-    F = zeros(num_voronoi_vertices+1, qh.input_dim)
-    F[1, :] .= Inf
-
-    C = Array{Any,2}(undef, nr, 1)
-    fill!(C, Array{Float64,2}(undef,0,0))
-    facet = qh.facet_list
-    for facetI=1:qh.num_facets
-        facet.seen = false
-        facet = facet.next
-    end
-
-    i = 0
-    k = 1
-
-    vertex = qh.vertex_list
-    while vertex.ptr != qh.vertex_tail.ptr
-        if qh.hull_dim == 3
-            qh_order_vertexneighbors(qh, vertex)
-        end
-        infinity_seen = false
-        idx = qh_point_id(qh, vertex.point)
-        num_vertices = ni[k]
-        k += 1
-
-        if num_vertices == 1
-            continue
-        end
-        facet_list = zeros(Int, num_vertices)
-
-        m = 1
-
-        neighborSet = vertex.neighbors
-        for neighborI = 1:qh_setsize(qh, neighborSet)
-            neighbor = neighborSet[neighborI]
-            if neighbor.upperdelaunay  != 0
-                if infinity_seen == false
-                    infinity_seen = true
-                    facet_list[m] = 1
-                    m += 1
-                    at_inf[idx+1] = true
-                end
-            else
-                if neighbor.seen == false
-                    i += 1
-                    for d = 1:qh.input_dim
-                        F[i+1, d] = neighbor.center[d]
-                    end
-                    neighbor.seen = true
-                    neighbor.visitid = i
-                end
-                facet_list[m] = neighbor.visitid + 1
-                m += 1
-            end
-        end
-        C[idx+1] = facet_list
-        vertex = vertex.next
-    end
-
-    return (F, C, at_inf)
-                
-end
-
-# getproperty/setproperty methods to get/set qhT struct internal fields
-function getproperty(qh::QHqhT, fld::Symbol)
-    if fld == :qh
-        return invoke(getproperty, Tuple{Any, Symbol}, qh, :qh)
-    else
-        (offset, qhT) = _qhT_defs[fld]
-        return unsafe_load(Ptr{qhT}(pointer(qh.qh) + _qhT_offsets[offset+1]))
-    end
-end
-
-
-function setproperty!(qh::QHqhT, fld::Symbol, val)
-    if fld == :qh
-        return invoke(setproperty, Tuple{Any, Symbol, Any}, qh, :qh, val)
-    else
-        (offset, qhT) = _qhT_defs[fld]
-        return unsafe_store!(Ptr{qhT}(pointer(qh.qh) + _qhT_offsets[offset+1]), qhT(val))
-    end
-end
-
-function getproperty(facet::QHfacetT, fld::Symbol)
-    if fld == :ptr
-        return invoke(getproperty, Tuple{Any, Symbol}, facet, :ptr)
-    else
-        (offset, facetT) = _facetT_defs[fld]
-        if facetT == QHflagT
-            flag_offset = (offset-floor(offset)).num
-            offset = Int(floor(offset))
-            val = (unsafe_load(Ptr{facetT}(facet.ptr + _facetT_offsets[offset+1])).flag >> flag_offset) & 0x1
-            return val
+        if xor(facet.toporient, qh_ORIENTclock) != 0
+            vertexA = facet.vertices[1] 
+            vertexB = facet.vertices[2]  
+            nextfacet = facet.neighbors[1]
         else
-            offset = Int(floor(offset))
-            return unsafe_load(Ptr{facetT}(facet.ptr + _facetT_offsets[offset+1]))
-        end
-    end
-end
-
-function setproperty!(facet::QHfacetT, fld::Symbol, val)
-    local load_offset
-    if fld == :ptr
-        return invoke(setproperty, Tuple{Any, Symbol, Any}, facet, :ptr, val)
-    else
-        (offset, facetT) = _facetT_defs[fld]
-        if facetT == QHflagT
-            load_offset = Int(floor(offset))
-            curr_val = unsafe_load(Ptr{facetT}(facet.ptr + _facetT_offsets[load_offset+1])).flag
-            flag_offset = (offset-floor(offset)).num
-            val = (curr_val & (xor(1 << flag_offset,0xffffffff))) | (val << flag_offset)
-        else
-            load_offset = Int(floor(offset))
+            vertexA = facet.vertices[2]  
+            vertexB = facet.vertices[1]  
+            nextfacet = facet.neighbors[2]
         end
         
-        return unsafe_store!(Ptr{facetT}(facet.ptr + _facetT_offsets[load_offset+1]), facetT(val))
+        # check if result array needs resizing
+        if n_extremes + 2 > length(extremes)
+            resize!(extremes, 2*length(extremes)+1)
+        end
+        if facet.visitid != 0  # qhull has this check, Scipy does not
+            if (vertexA.visitid != qh_vertex_visit)
+                # this updates also internal qhull vertex state
+                vertexA.visitid = QHuintT(qh_vertex_visit)
+                n_extremes += 1            
+                extremes[n_extremes] = qh_pointid(qh_ptr, vertexA.point_ptr) + 1 # +1 to change to 1-based index
+            end
+            if vertexB.visitid != qh_vertex_visit
+                vertexB.visitid = QHuintT(qh_vertex_visit)
+                n_extremes += 1            
+                extremes[n_extremes] = qh_pointid(qh_ptr, vertexB.point_ptr) + 1 # +1 to change to 1-based index
+            end
+        end
+        # this updates also internal qhull facet state
+        facet.visitid = QHuintT(qh_visit_id);
+        facet = nextfacet
 
-    end
-end
-
-function getproperty(vertex::QHvertexT, fld::Symbol)
-    if fld == :ptr
-        return invoke(getproperty, Tuple{Any, Symbol}, vertex, :ptr)
-    else
-        (offset, fldT) = _vertexT_defs[fld]
-        if fld == :point
-            return unsafe_load(Ptr{fldT}(vertex.ptr + _vertexT_offsets[offset+1]))
-        else
-            return unsafe_load(Ptr{fldT}(vertex.ptr + _vertexT_offsets[offset+1]))
+        if facet.id == start_facet_id
+            break
         end
     end
-end
-
-function getproperty(vtxSet::QHsetT{T}, fld::Symbol) where T <: Union{QHvertexT, QHfacetT}
-    if fld == :ptr
-        return invoke(getproperty, Tuple{Any, Symbol}, vtxSet, :ptr)
-    elseif fld == :maxsize
-        return unsafe_load(Ptr{Cint}(vtxSet.ptr))
-    else
-        error("Invalid field.")
-    end
-end
-
-function getindex(vtxSet::QHsetT{T}, I::Int) where T <: Union{QHvertexT, QHfacetT}
-    if I > vtxSet.maxsize
-        error("out of bounds.")
-    end
-
-    offset = I*_setT_offsets[2]
-    return unsafe_load(Ptr{T}(vtxSet.ptr+offset))
+    
+    resize!(extremes, n_extremes)
+    return extremes
     
 end
 
-function getindex(pnt::QHpointT, I::Int)
-    offset = (I-1)*sizeof(Float64)
-    return unsafe_load(Ptr{Float64}(pnt.ptr+offset))
 end
-
-function getindex(pnt::QHcoordT, I::Int)
-    offset = (I-1)*sizeof(Float64)
-    return unsafe_load(Ptr{Float64}(pnt.ptr+offset))
-end
-
-
-# methods/settings to access Qhull internals directly
-
-const _qhT_offsets = Vector{Csize_t}(undef, 257)
-const _facetT_offsets = Vector{Csize_t}(undef, 44)
-const _vertexT_offsets = Vector{Csize_t}(undef, 12)
-const _setT_offsets = Vector{Csize_t}(undef, 2)
-
-function _set_qhT_offsets()
-    ccall((:jl_qhull_qhT_offsets, libqhull_helper), Cvoid,
-          (Ptr{Vector{Csize_t}},), pointer(_qhT_offsets))
-end
-function _set_facetT_offsets()
-    ccall((:jl_qhull_facetT_offsets, libqhull_helper), Cvoid,
-          (Ptr{Vector{Csize_t}},), pointer(_facetT_offsets))
-end
-function _set_vertexT_offsets()
-    ccall((:jl_qhull_vertexT_offsets, libqhull_helper), Cvoid,
-          (Ptr{Vector{Csize_t}},), pointer(_vertexT_offsets))
-end
-
-function _set_setT_offsets()
-    ccall((:jl_qhull_setT_offsets, libqhull_helper), Cvoid,
-          (Ptr{Vector{Csize_t}},), pointer(_setT_offsets))
-end
-
-_set_qhT_offsets()
-_set_facetT_offsets()
-_set_vertexT_offsets()
-_set_setT_offsets()
-
-_qhT_defs = Dict{Symbol, Tuple{Int,DataType}}([(:ALLpoints => (0, QHboolT)),
-                                             (:ALLOWshort => (1, QHboolT)),
-(:ALLOWwarning => (2, QHboolT)),
-(:ALLOWwide => (3, QHboolT)),
-(:ANGLEmerge => (4, QHboolT)),
-(:APPROXhull => (5, QHboolT)),
-(:MINoutside => (6, QHrealT)),
-(:ANNOTATEoutput => (7, QHboolT)),
-(:ATinfinity => (8, QHboolT)),
-(:AVOIDold => (9, QHboolT)),
-(:BESToutside => (10, QHboolT)),
-(:CDDinput => (11, QHboolT)),
-(:CDDoutput => (12, QHboolT)),
-(:CHECKduplicates => (13, QHboolT)),
-(:CHECKfrequently => (14, QHboolT)),
-(:premerge_cos => (15, QHrealT)),
-(:postmerge_cos => (16, QHrealT)),
-(:DELAUNAY => (17, QHboolT)),
-(:DOintersections => (18, QHboolT)),
-(:DROPdim => (19, QHint)),
-(:FLUSHprint => (20, QHboolT)),
-(:FORCEoutput => (21, QHboolT)),
-(:GOODpoint => (22, QHint)),
-(:GOODpointp => (23, Ptr{QHpointT})),
-(:GOODthreshold => (24, QHboolT)),
-(:GOODvertex => (25, QHint)),
-(:GOODvertexp => (26, Ptr{QHpointT})),
-(:HALFspace => (27, QHboolT)),
-(:ISqhullQh => (28, QHboolT)),
-(:IStracing => (29, QHint)),
-(:KEEParea => (30, QHint)),
-(:KEEPcoplanar => (31, QHboolT)),
-(:KEEPinside => (32, QHboolT)),
-(:KEEPmerge => (33, QHint)),
-(:KEEPminArea => (34, QHrealT)),
-(:MAXcoplanar => (35, QHrealT)),
-(:MAXwide => (36, QHint)),
-(:MERGEexact => (37, QHboolT)),
-(:MERGEindependent => (38, QHboolT)),
-(:MERGING => (39, QHboolT)),
-(:premerge_centrum => (40, QHrealT)),
-(:postmerge_centrum => (41, QHrealT)),
-(:MERGEpinched => (42, QHboolT)),
-(:MERGEvertices => (43, QHboolT)),
-(:MINvisible => (44, QHrealT)),
-(:NOnarrow => (45, QHboolT)),
-(:NOnearinside => (46, QHboolT)),
-(:NOpremerge => (47, QHboolT)),
-(:ONLYgood => (48, QHboolT)),
-(:ONLYmax => (49, QHboolT)),
-(:PICKfurthest => (50, QHboolT)),
-(:POSTmerge => (51, QHboolT)),
-(:PREmerge => (52, QHboolT)),
-(:PRINTcentrums => (53, QHboolT)),
-(:PRINTcoplanar => (54, QHboolT)),
-(:PRINTdim => (55, QHint)),
-(:PRINTdots => (56, QHboolT)),
-(:PRINTgood => (57, QHboolT)),
-(:PRINTinner => (58, QHboolT)),
-(:PRINTneighbors => (59, QHboolT)),
-(:PRINTnoplanes => (60, QHboolT)),
-(:PRINToptions1st => (61, QHboolT)),
-(:PRINTouter => (62, QHboolT)),
-(:PRINTprecision => (63, QHboolT)),
-(:PRINTout => (64, QHprintT)),
-(:PRINTridges => (65, QHboolT)),
-(:PRINTspheres => (66, QHboolT)),
-(:PRINTstatistics => (67, QHboolT)),
-(:PRINTsummary => (68, QHboolT)),
-(:PRINTtransparent => (69, QHboolT)),
-(:PROJECTdelaunay => (70, QHboolT)),
-(:PROJECTinput => (71, QHint)),
-(:RANDOMdist => (72, QHboolT)),
-(:RANDOMfactor => (73, QHrealT)),
-(:RANDOMa => (74, QHrealT)),
-(:RANDOMb => (75, QHrealT)),
-(:RANDOMoutside => (76, QHboolT)),
-(:REPORTfreq => (77, QHint)),
-(:REPORTfreq2 => (78, QHint)),
-(:RERUN => (79, QHint)),
-(:ROTATErandom => (80, QHint)),
-(:SCALEinput => (81, QHboolT)),
-(:SCALElast => (82, QHboolT)),
-(:SETroundoff => (83, QHboolT)),
-(:SKIPcheckmax => (84, QHboolT)),
-(:SKIPconvex => (85, QHboolT)),
-(:SPLITthresholds => (86, QHboolT)),
-(:STOPadd => (87, QHint)),
-(:STOPcone => (88, QHint)),
-(:STOPpoint => (89, QHint)),
-(:TESTpoints => (90, QHint)),
-(:TESTvneighbors => (91, QHboolT)),
-(:TRACElevel => (92, QHint)),
-(:TRACElastrun => (93, QHint)),
-(:TRACEpoint => (94, QHint)),
-(:TRACEdist => (95, QHrealT)),
-(:TRACEmerge => (96, QHint)),
-(:TRIangulate => (97, QHboolT)),
-(:TRInormals => (98, QHboolT)),
-(:UPPERdelaunay => (99, QHboolT)),
-(:USEstdout => (100, QHboolT)),
-(:VERIFYoutput => (101, QHboolT)),
-(:VIRTUALmemory => (102, QHboolT)),
-(:VORONOI => (103, QHboolT)),
-(:AREAfactor => (104, QHrealT)),
-(:DOcheckmax => (105, QHboolT)),
-(:feasible_string => (106, Ptr{QHchar})),
-(:feasible_point => (107, Ptr{QHcoordT})),
-(:GETarea => (108, QHboolT)),
-(:KEEPnearinside => (109, QHboolT)),
-(:hull_dim => (110, QHint)),
-(:input_dim => (111, QHint)),
-(:num_points => (112, QHint)),
-(:first_point => (113, Ptr{QHpointT})),
-(:POINTSmalloc => (114, QHboolT)),
-(:input_points => (115, Ptr{QHpointT})),
-(:input_malloc => (116, QHboolT)),
-(:qhull_command => (117, QHchar)),
-(:qhull_commandsiz2 => (118, QHint)),
-(:rbox_command => (119, QHchar)),
-(:qhull_options => (120, QHchar)),
-(:qhull_optionlen => (121, QHint)),
-(:qhull_optionsiz => (122, QHint)),
-(:qhull_optionsiz2 => (123, QHint)),
-(:run_id => (124, QHint)),
-(:VERTEXneighbors => (125, QHboolT)),
-(:ZEROcentrum => (126, QHboolT)),
-(:upper_threshold => (127, Ptr{QHrealT})),
-(:lower_threshold => (128, Ptr{QHrealT})),
-(:upper_bound => (129, Ptr{QHrealT})),
-(:lower_bound => (130, Ptr{QHrealT})),
-(:ANGLEround => (131, QHrealT)),
-(:centrum_radius => (132, QHrealT)),
-(:cos_max => (133, QHrealT)),
-(:DISTround => (134, QHrealT)),
-(:MAXabs_coord => (135, QHrealT)),
-(:MAXlastcoord => (136, QHrealT)),
-(:MAXoutside => (137, QHrealT)),
-(:MAXsumcoord => (138, QHrealT)),
-(:MAXwidth => (139, QHrealT)),
-(:MINdenom_1 => (140, QHrealT)),
-(:MINdenom => (141, QHrealT)),
-(:MINdenom_1_2 => (142, QHrealT)),
-(:MINdenom_2 => (143, QHrealT)),
-(:MINlastcoord => (144, QHrealT)),
-(:NEARzero => (145, Ptr{QHrealT})),
-(:NEARinside => (146, QHrealT)),
-(:ONEmerge => (147, QHrealT)),
-(:outside_err => (148, QHrealT)),
-(:WIDEfacet => (149, QHrealT)),
-(:NARROWhull => (150, QHboolT)),
-(:qhull => (151, QHchar)),
-(:errexit => (152, QHjmpbufT)),
-(:jmpXtra => (153, QHchar)),
-(:restartexit => (154, QHjmpbufT)),
-(:jmpXtra2 => (155, QHchar)),
-(:fin => (156, Ptr{QHfileT})),
-(:fout => (157, Ptr{QHfileT})),
-(:ferr => (158, Ptr{QHfileT})),
-(:interior_point => (159, Ptr{QHpointT})),
-(:normal_size => (160, QHint)),
-(:center_size => (161, QHint)),
-(:TEMPsize => (162, QHint)),
-(:facet_list => (163, QHfacetT)),
-(:facet_tail => (164, QHfacetT)),
-(:facet_next => (165, QHfacetT)),
-(:newfacet_list => (166, QHfacetT)),
-(:visible_list => (167, QHfacetT)),
-(:num_visible => (168, QHint)),
-(:tracefacet_id => (169, QHuint)),
-(:tracefacet => (170, Ptr{QHfacetT})),
-(:traceridge_id => (171, QHuint)),
-(:traceridge => (172, Ptr{QHridgeT})),
-(:tracevertex_id => (173, QHuint)),
-(:tracevertex => (174, Ptr{QHvertexT})),
-(:vertex_list => (175, QHvertexT)),
-(:vertex_tail => (176, QHvertexT)),
-(:newvertex_list => (177, Ptr{QHvertexT})),
-(:num_facets => (178, QHint)),
-(:num_vertices => (179, QHint)),
-(:num_outside => (180, QHint)),
-(:num_good => (181, QHint)),
-(:facet_id => (182, QHuint)),
-(:ridge_id => (183, QHuint)),
-(:vertex_id => (184, QHuint)),
-(:first_newfacet => (185, QHuint)),
-(:hulltime => (186, QHulong)),
-(:ALLOWrestart => (187, QHboolT)),
-(:build_cnt => (188, QHint)),
-(:CENTERtype => (189, QHcenterT)),
-(:furthest_id => (190, QHint)),
-(:last_errcode => (191, QHint)),
-(:GOODclosest => (192, Ptr{QHfacetT})),
-(:coplanar_apex => (193, Ptr{QHpointT})),
-(:hasAreaVolume => (194, QHboolT)),
-(:hasTriangulation => (195, QHboolT)),
-(:isRenameVertex => (196, QHboolT)),
-(:JOGGLEmax => (197, QHrealT)),
-(:maxoutdone => (198, QHboolT)),
-(:max_outside => (199, QHrealT)),
-(:max_vertex => (200, QHrealT)),
-(:min_vertex => (201, QHrealT)),
-(:NEWfacets => (202, QHboolT)),
-(:NEWtentative => (203, QHboolT)),
-(:findbestnew => (204, QHboolT)),
-(:findbest_notsharp => (205, QHboolT)),
-(:NOerrexit => (206, QHboolT)),
-(:PRINTcradius => (207, QHrealT)),
-(:PRINTradius => (208, QHrealT)),
-(:POSTmerging => (209, QHboolT)),
-(:printoutvar => (210, QHint)),
-(:printoutnum => (211, QHint)),
-(:repart_facetid => (212, QHuint)),
-(:retry_addpoint => (213, QHint)),
-(:QHULLfinished => (214, QHboolT)),
-(:totarea => (215, QHrealT)),
-(:totvol => (216, QHrealT)),
-(:visit_id => (217, QHuint)),
-(:vertex_visit => (218, QHuint)),
-(:WAScoplanar => (219, QHboolT)),
-(:ZEROall_ok => (220, QHboolT)),
-(:facet_mergeset => (221, Ptr{QHsetT})),
-(:degen_mergeset => (222, Ptr{QHsetT})),
-(:vertex_mergeset => (223, Ptr{QHsetT})),
-(:hash_table => (224, Ptr{QHsetT})),
-(:other_points => (225, Ptr{QHsetT})),
-(:del_vertices => (226, QHsetT{QHvertexT})),
-(:gm_matrix => (227, Ptr{QHcoordT})),
-(:gm_row => (228, Ptr{Ptr{QHcoordT}})),
-(:line => (229, Ptr{QHchar})),
-(:maxline => (230, QHint)),
-(:half_space => (231, Ptr{QHcoordT})),
-(:temp_malloc => (232, Ptr{QHcoordT})),
-(:ERREXITcalled => (233, QHboolT)),
-(:firstcentrum => (234, QHboolT)),
-(:old_randomdist => (235, QHboolT)),
-(:coplanarfacetset => (236, Ptr{QHsetT})),
-(:last_low => (237, QHrealT)),
-(:last_high => (238, QHrealT)),
-(:last_newhigh => (239, QHrealT)),
-(:lastcpu => (240, QHrealT)),
-(:lastfacets => (241, QHint)),
-(:lastmerges => (242, QHint)),
-(:lastplanes => (243, QHint)),
-(:lastdist => (244, QHint)),
-(:lastreport => (245, QHuint)),
-(:mergereport => (246, QHint)),
-(:old_tempstack => (247, Ptr{QHsetT})),
-(:ridgeoutnum => (248, QHint)),
-(:last_random => (249, QHint)),
-(:rbox_errexit => (250, QHjmpbufT)),
-(:jmpXtra3 => (251, QHchar)),
-(:rbox_isinteger => (252, QHint)),
-(:rbox_out_offset => (253, QHdouble)),
-(:cpp_object => (254, QHvoid)),
-(:qhmem => (255, QHmemT)),
-(:qhstat => (256, QHstatT))])
-
-_facetT_defs = Dict{Symbol, Tuple{Number,DataType}}([
-(:furthestdist => (0, QHcoordT)),
-(:maxoutside => (1, QHcoordT)),
-(:offset => (2, QHcoordT)),
-(:normal => (3, Ptr{QHcoordT})),
-(:area => (4, QHrealT)),
-(:replace => (5, QHfacetT)),
-(:samecycle => (6, QHfacetT)),
-(:newcycle => (7, QHfacetT)),
-(:trivisible => (8,QHfacetT)),
-(:triowner => (9, QHfacetT)),
-(:center => (10, QHcoordT)),
-(:previous => (11, QHfacetT)),
-(:next => (12, QHfacetT)),
-(:vertices => (13, QHsetT{QHvertexT})),
-(:ridges => (14, Ptr{QHsetT})),
-(:neighbors => (15, Ptr{QHsetT})),
-(:outsideset => (16, Ptr{QHsetT})),
-(:coplanarset => (17, Ptr{QHsetT})),
-(:visitid => (18, QHuint)),
-(:id => (19, QHuint)),
-(:nummerge => (20, QHuint)),
-(:tricoplanar => (21, QHflagT)),
-(:newfacet => (22, QHflagT)),
-(:visible => (23, QHflagT)),
-(:toporient => (24, QHflagT)),
-(:implicial => (25, QHflagT)),
-(:seen => (26+14//33, QHflagT)),
-(:seen2 => (27, QHflagT)),
-(:flipped => (28, QHflagT)),
-(:upperdelaunay => (29+17//33, QHflagT)),
-(:notfurthest => (30, QHflagT)),
-(:good => (31, QHflagT)),
-(:isarea => (32, QHflagT)),
-(:dupridge => (33, QHflagT)),
-(:mergeridge => (34, QHflagT)),
-(:mergeridge2 => (35, QHflagT)),
-(:coplanarhorizon => (36, QHflagT)),
-(:mergehorizon => (37, QHflagT)),
-(:cycledone => (38, QHflagT)),
-(:tested => (39, QHflagT)),
-(:keepcentrum => (40, QHflagT)),
-(:newmerge => (41, QHflagT)),
-(:degenerate => (42, QHflagT)),
-    (:redundant => (43, QHflagT))])
-
-
-
-_vertexT_defs = Dict{Symbol, Tuple{Int,DataType}}([
-    (:next => (0, QHvertexT)),
-    (:previous => (1, QHvertexT)),
-    (:point => (2, QHpointT)),
-    (:neighbors => (3, QHsetT{QHfacetT})),
-    (:id => (4, QHuint)),
-    (:visitid => (5, QHuint)),
-    (:seen => (6, QHflagT)),
-    (:seen2 => (7, QHflagT)),
-    (:deleted => (8, QHflagT)),
-    (:delridge => (9, QHflagT)),
-    (:newfacet => (10, QHflagT)),
-    (:partitioned => (11, QHflagT))])
-
-
-end # module
