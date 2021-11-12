@@ -22,13 +22,15 @@ module DirectQHull
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# function "qh_get_extremes_2d" defined later licensed under BSD license from Scipy
+# functions "qh_get_extremes_2d" and "qh_get_simplex_facet_arrays" defined later
+# licensed under BSD license from Scipy
 
 import Qhull_jll
 
 import Base.getproperty
 import Base.iterate
 import Base.getindex
+import Base.length
 
 # define Qhull types
 
@@ -46,7 +48,9 @@ QHdoubleT = Cdouble
 QHvoidT = Cvoid
 QHfileT = Cvoid
 
+export ConvexHull
 
+# holds pointer to qhT structure
 mutable struct qhT
 end
 
@@ -60,7 +64,7 @@ function qh_alloc_qh(err_file::Ptr{Cvoid}=C_NULL)
     (qh_ptr != C_NULL) ? qh_ptr : throw(ErrorException("qhT initialization failure."))
 end
 
-# This should always be true
+# This should always be true (tested for the QHsetT so that Union{Int, Pointers} as QHsetT element is valid) 
 @assert(sizeof(Ptr{Cvoid}) == sizeof(Int))
 
 abstract type QHsetelemT end
@@ -68,17 +72,19 @@ abstract type QHsetelemT end
 # this is not an exact representation of QHull's set type
 # Qhull set is dynamically allocated so exact representation is not straighforward as Julia type.
 # (would require NTuple type for elements with tuple length equal to number elements in the list)
+# so the set elements are wrapped by Julia array
 # QH set element type is defined as union of void pointer and integer
-struct QHsetT{T<:Union{QHintT, Ptr{<:QHsetelemT}}}
+struct QHsetT{T<:Union{QHintT, Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}}}
     maxsize::QHintT          # /* maximum number of elements (except NULL) */
     e::Array{T}              # /* array of pointers, tail is NULL */
                              # /* last slot (unless NULL) is actual size+1
                              # /* e[maxsize]==NULL or e[e[maxsize]-1]==NULL */
                              # /* this may generate a warning since e[] contains  maxsize elements */
-    function QHsetT{T}(ptr::Ptr{QHsetT{T}}) where T<:Ptr{<:QHsetelemT}
+    function QHsetT{T}(ptr::Ptr{QHsetT{T}}) where T<:Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}
         max_size = unsafe_load(Ptr{QHintT}(ptr))
         # with passing C_NULL as qh_ptr below the call will crash, if the setsize is invalid
-        # however, qhull would exit in this case with internal error in a more gracious manner
+        # however, qhull would anyway exit in this case with internal error, though in a more gracious manner
+        # (this removes the need to pass the qhT pointer to this constructor)
         set_size = qh_setsize(Ptr{qhT}(C_NULL), ptr)
         # assumed here QHsetT field e is offset Ptr-size from the maxsize field
         ptr_array = unsafe_wrap(Array, Ptr{T}(ptr+sizeof(Ptr)), set_size)
@@ -91,8 +97,41 @@ function Base.getindex(set::QHsetT{T}, idx::Int) where T<:Union{QHintT, Ptr{<:QH
     unsafe_load(ptr)
 end
 
+function Base.length(set::QHsetT{T}) where T<:Union{QHintT, Ptr{<:QHsetelemT}}
+    return length(set.e)
+end
+
+# QH set as providing raw pointers
+struct QHsetPtrT{T<:Union{QHintT, Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}}}
+    maxsize::QHintT          # /* maximum number of elements (except NULL) */
+    e::Array{T}              # /* array of pointers, tail is NULL */
+                             # /* last slot (unless NULL) is actual size+1
+                             # /* e[maxsize]==NULL or e[e[maxsize]-1]==NULL */
+                             # /* this may generate a warning since e[] contains  maxsize elements */
+    function QHsetPtrT{T}(ptr::Ptr{QHsetPtrT{T}}) where T<:Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}
+        max_size = unsafe_load(Ptr{QHintT}(ptr))
+        # with passing C_NULL as qh_ptr below the call will crash, if the setsize is invalid
+        # however, qhull would anyway exit in this case with internal error, though in a more gracious manner
+        # (this removes the need to pass the qhT pointer to this constructor)
+        set_size = qh_setsize(Ptr{qhT}(C_NULL), ptr)
+        # assumed here QHsetT field e is offset Ptr-size from the maxsize field
+        ptr_array = unsafe_wrap(Array, Ptr{T}(ptr+sizeof(Ptr)), set_size)
+        new(max_size, ptr_array)
+    end
+end
+
+function Base.getindex(set::QHsetPtrT{T}, idx::Int) where T<:Union{QHintT, Ptr{<:QHsetelemT}}
+    ptr = set.e[idx]
+    ptr
+end
+
+function Base.length(set::QHsetPtrT{T}) where T<:Union{QHintT, Ptr{<:QHsetelemT}}
+    return length(set.e)
+end
+
 
 # Qhull vertex type
+# Comments are from original qhull code.
 mutable struct QHvertexT{HD} <: QHsetelemT
     next::Ptr{QHvertexT{HD}}                # /* next vertex in vertex_list or vertex_tail */
     previous::Ptr{QHvertexT{HD}}            # /* previous vertex in vertex_list or NULL, for C++ interface */
@@ -117,6 +156,7 @@ mutable struct QHvertexT{HD} <: QHsetelemT
 end
 
 # Qhull facet type
+# Comments are from original qhull code.
 mutable struct QHfacetT{HD} <: QHsetelemT
     furthestdist::QHcoordT  # distance to furthest point of outsideset
     maxoutside::QHcoordT    # max computed distance of point to facet
@@ -166,7 +206,7 @@ mutable struct QHfacetT{HD} <: QHsetelemT
     outsideset::Ptr{QHsetT} # set of points outside this facet
                             # if non-empty, last point is furthest
                             # if NARROWhull, includes coplanars (less than qh.MINoutside) for partitioning*/
-    coplanarset::Ptr{QHsetT} # set of points coplanar with this facet
+    coplanarset::Ptr{QHsetT{Ptr{NTuple{HD, QHpointT}}}} # set of points coplanar with this facet
                              # >= qh.min_vertex and <= facet->max_outside
                              # a point is assigned to the furthest facet
                              # if non-empty, last point is furthest away */
@@ -250,7 +290,7 @@ end
 
 
 # Iterate QHsetT with pointer types
-function iterate(set::QHsetT{T}) where T<:Ptr{<:QHsetelemT}
+function iterate(set::QHsetT{T}) where T<:Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}
 
     if length(set.e) == 0
         return nothing
@@ -259,11 +299,29 @@ function iterate(set::QHsetT{T}) where T<:Ptr{<:QHsetelemT}
     end
 end
 
-function iterate(set::QHsetT{T}, idx::Int) where T<:Ptr{<:QHsetelemT}
+function iterate(set::QHsetT{T}, idx::Int) where T<:Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}
     if idx > length(set.e)
         return nothing
     else
         return (unsafe_load(set.e[idx]), idx+1)
+    end
+end
+
+# Iterate QHsetT with pointer types
+function iterate(set::QHsetPtrT{T}) where T<:Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}
+
+    if length(set.e) == 0
+        return nothing
+    else
+        return (set.e[1], 2)
+    end
+end
+
+function iterate(set::QHsetPtrT{T}, idx::Int) where T<:Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}
+    if idx > length(set.e)
+        return nothing
+    else
+        return (set.e[idx], idx+1)
     end
 end
 
@@ -274,12 +332,16 @@ struct ConvexHull
     points::Matrix{QHcoordT}
     vertices::Vector{QHuintT}
     simplices::Matrix{QHuintT}
+    neighbors::Matrix{QHuintT}
+    equations::Matrix{QHrealT}
+    coplanar::Matrix{QHintT}
+    good::Vector{QHboolT}
     area::QHrealT
     volume::QHrealT
     max_bound::Vector{QHrealT}
     min_bound::Vector{QHrealT}
     
-    function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{AbstractString}=Vector{AbstractString}())
+    function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
         qh_ptr = qh_alloc_qh()
 
         pushfirst!(qhull_options, "Qt")
@@ -293,7 +355,6 @@ struct ConvexHull
 
         # calculate new qhull
         res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
-
         
         hd = qh_get_hull_dim(qh_ptr)
 
@@ -307,6 +368,15 @@ struct ConvexHull
         # for some reason using hd from above in Val(hd) crashes Julia
         simplices = qh_get_convex_hull_pnts(qh_ptr, Val(size(pnts,1)))
 
+        # facet neighbors, equations, good
+        neighbors, equations, coplanar, good = qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)))
+
+        if ("QG" in qhull_options || "QG4" in qhull_options)
+            Bool.(good)
+        else
+            good = Vector{QHboolT}()
+        end
+        
         # calculate total area and volume
         qh_getarea(qh_ptr, Val(size(pnts,1)))
         area = qh_get_totarea(qh_ptr)
@@ -317,7 +387,8 @@ struct ConvexHull
         min_bound = minimum(pnts, dims=2)[:]
 
         # the new Qhull value
-        new(qh_ptr, pnts, vertices, simplices, area, vol, max_bound, min_bound)
+        new(qh_ptr, pnts, vertices, simplices, neighbors, equations, coplanar,
+            good, area, vol, max_bound, min_bound)
     end    
 end
 
@@ -344,17 +415,31 @@ function qh_pointid(qh::Ptr{qhT}, pnt::Ptr{NTuple{N, QHpointT}}) where N
                (Ptr{qhT}, Ptr{QHpointT}), qh, pnt)
     return id
 end
+function qh_pointid(qh::Ptr{qhT}, pnt::Ptr{QHpointT}) where N
+    id = ccall((:qh_pointid, qh_lib), Cuint,
+               (Ptr{qhT}, Ptr{QHpointT}), qh, pnt)
+    return id
+end
+
+# retrieve Qhull internal point id
+function qh_nearvertex(qh::Ptr{qhT}, fct::Ptr{QHfacetT{HD}}, pnt::Ptr{QHpointT}, dist::Array{QHrealT,1}) where HD
+    return ccall((:qh_nearvertex, qh_lib), Ptr{QHvertexT{HD}},
+                 (Ptr{qhT}, Ptr{QHfacetT{HD}}, Ptr{QHpointT}, Ptr{QHrealT}), qh, fct, pnt, dist)
+end
 
 # retrieve Qhull set size
-function qh_setsize(qh::Ptr{qhT}, set::Ptr{QHsetT{T}}) where T<:Union{QHintT, Ptr{<:QHsetelemT}}
+function qh_setsize(qh::Ptr{qhT}, set::Ptr{QHsetT{T}}) where T<:Union{QHintT, Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}}
     ccall((:qh_setsize, qh_lib), Cint, (Ptr{qhT}, Ptr{QHsetT}), qh, set)
+end
+function qh_setsize(qh::Ptr{qhT}, set::Ptr{QHsetPtrT{T}}) where T<:Union{QHintT, Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}}
+    ccall((:qh_setsize, qh_lib), Cint, (Ptr{qhT}, Ptr{QHsetPtrT}), qh, set)
 end
 
 
 # GETTER accessors for plain data types
 for (T, getter) in ((:QHintT, :qh_get_hull_dim), (:QHintT, :qh_get_num_facets), (:QHintT, :qh_get_num_points),
                     (:QHintT, :qh_get_num_vertices), (:QHintT, :qh_get_visit_id), (:QHintT, :qh_get_vertex_visit),
-                    (:QHrealT, :qh_get_totarea), (:QHrealT, :qh_get_totvol))
+                    (:QHrealT, :qh_get_totarea), (:QHrealT, :qh_get_totvol), (:QHuintT, :qh_get_facet_id))
     @eval begin
         function ($getter)(qh::Ptr{qhT})
             ccall(($(QuoteNode(getter)), qh_lib), $T, (Ptr{qhT},), qh)
@@ -457,6 +542,14 @@ function Base.getproperty(fct::QHfacetT{HD}, fld::Symbol) where HD
         end
     elseif fld === :next_ptr
         return getfield(fct, :next)
+    elseif fld === :self_ptr
+        # ID=0 is dummy facet, with next=C_NULL
+        # (so the facet cannot be updated in this case)
+        if (fct.id != 0) 
+            return fct.next.previous
+        else
+            throw(ErrorException("Cannot get self pointer for last facet in facet list."))
+        end
     elseif fld === :vertices
         return QHsetT{Ptr{QHvertexT{HD}}}(fct.vertices_ptr)
     elseif fld === :vertices_ptr
@@ -465,8 +558,32 @@ function Base.getproperty(fct::QHfacetT{HD}, fld::Symbol) where HD
         return QHsetT{Ptr{QHfacetT{HD}}}(fct.neighbors_ptr)
     elseif fld === :neighbors_ptr
         return getfield(fct, :neighbors)
+    elseif fld === :coplanarset
+        ptr = fct.coplanarset_ptr
+        if ptr != C_NULL
+            return QHsetT{Ptr{NTuple{HD, QHpointT}}}(ptr)
+        else
+            return nothing
+        end
+    elseif fld === :coplanarset_ptr
+        return getfield(fct, :coplanarset)
+    elseif fld === :coplanar_ptr_set
+        ptr = fct.coplanarset_ptr
+        if ptr != C_NULL
+            return QHsetPtrT{Ptr{QHpointT}}(Ptr{QHsetPtrT{Ptr{QHpointT}}}(ptr))
+        else
+            return nothing
+        end
+    elseif fld === :normal
+        return unsafe_load(fct.normal_ptr)
+    elseif fld === :normal_ptr
+        return getfield(fct, :normal)
     elseif fld == :toporient
         return QHboolT( (getfield(fct, :flags)>>12)&1)  # toporient is 13th bit in the flags field
+    elseif fld == :simplicial
+        return QHboolT( (getfield(fct, :flags)>>13)&1)  # simplicial is 14th bit in the flags field
+    elseif fld == :good
+        return QHboolT( (getfield(fct, :flags)>>19)&1)  # good is 20th bit in the flags field
     else
         return getfield(fct, fld)
     end
@@ -476,13 +593,9 @@ end
 function Base.setproperty!(fct::QHfacetT{HD}, fld::Symbol, value) where HD
     setfield!(fct, fld, value)
     # store back to qhull, pointer to self is obtained (somewhat dangerously) utilizing the facet linked list
-    if (fct.id != 0) # ID=0 is dummy facet, with next=C_NULL (so the facet cannot be updated in this case)
-        unsafe_store!(fct.next.previous, fct)
-    end
+    unsafe_store!(fct.self_ptr, fct)
     return value
 end
-
-
 
 function Base.getproperty(vtx::QHvertexT, fld::Symbol)
     if fld === :next
@@ -562,9 +675,9 @@ function qh_get_convex_hull_vertices(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
     return vertices
 end
 
-
-# Below function "qh_get_extremes_2d" adapted from from Qhull/io.c and
-# Scipy/_qhull.pyx/get_extremes_2d with the below license from _qhull.pyx/Scipy
+# Below functions "qh_get_extremes_2d" and "qh_get_simplex_facet_arrays" are
+# adapted from Qhull/io.c and Scipy/_qhull.pyx/get_extremes_2d with the
+# below BSD license from _qhull.pyx/Scipy
 #
 # Copyright (C)  Pauli Virtanen, 2010.
 #
@@ -628,7 +741,7 @@ function qh_get_extremes_2d(qh_ptr::Ptr{qhT})
 
     # get first facet in facet list
     facet = qh_get_facet_list(qh_ptr, Val(qh_get_hull_dim(qh_ptr)))
-
+    
     # use facet id instead of pointer comparision for ending the while loop
     start_facet_id = facet.id
 
@@ -675,7 +788,77 @@ function qh_get_extremes_2d(qh_ptr::Ptr{qhT})
     
     resize!(extremes, n_extremes)
     return extremes
-    
 end
+
+# get calculated convex hull points as Julia Int Array
+function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
+    n_facets = qh_get_num_facets(qh_ptr)
+    
+    facet_list = qh_get_facet_list(qh_ptr, Val(HD))
+    
+    id_map = fill!(Vector{QHintT}(undef, qh_get_facet_id(qh_ptr)), QHintT(-1))
+
+    j = 1 # 1 based index in Julia
+    for facet in facet_list
+        if (facet.simplicial != 0) &&
+            (length(facet.vertices) != HD) || (length(facet.neighbors) != HD)
+            throw(ErrorException("Non-simplical facet encountered."))
+        end
+        id_map[facet.id] = j
+        j += 1
+    end
+    
+    # facet neighors
+    neighbors = Matrix{QHuintT}(undef, HD, n_facets)
+    facets = Matrix{QHintT}(undef, HD, n_facets)
+    good = Vector{QHintT}(undef, n_facets)
+    equations = Matrix{QHrealT}(undef, HD+1, n_facets)
+    coplanar = zeros(QHintT, 10, 3)
+    ncoplanar = 1
+    
+    facet_ix = 1
+    for facet in facet_list
+        neighborSet = facet.neighbors
+
+        neighbor_ix = 1
+        for neighbor in neighborSet            
+            neighbors[neighbor_ix, facet_ix] = id_map[neighbor.id]
+            neighbor_ix+=1
+        end
+
+        for ix in 1:HD
+            equations[ix, facet_ix] = facet.normal[ix]
+        end
+        equations[HD+1, facet_ix] = facet.offset
+
+        dist = Array{QHrealT}(undef, 1)
+
+        # Save coplanar info
+        if !isnothing(facet.coplanar_ptr_set)
+            for point_ptr in facet.coplanar_ptr_set
+                vertex = unsafe_load(qh_nearvertex(qh_ptr, facet.self_ptr, point_ptr, dist))
+                if ncoplanar >= size(coplanar, 1)
+                    # The array is always safe to resize
+                    coplanar = cat(coplanar, zeros(QHintT, ncoplanar + 1, 3), dims=1)
+                end
+                coplanar[ncoplanar, 1] = qh_pointid(qh_ptr, point_ptr)
+                coplanar[ncoplanar, 2] = id_map[facet.id]
+                coplanar[ncoplanar, 3] = qh_pointid(qh_ptr, vertex.point_ptr)
+                ncoplanar += 1
+            end
+        end
+        
+        # save good info
+        good[facet_ix] = facet.good
+        facet_ix+=1
+    end
+
+    # resize
+    coplanar = coplanar[1:ncoplanar-1, :]
+    
+    return (neighbors, equations, coplanar, good)
+end
+
+
 
 end
