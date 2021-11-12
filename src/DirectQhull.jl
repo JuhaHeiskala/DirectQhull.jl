@@ -1,4 +1,4 @@
-module DirectQHull
+module DirectQhull
 
 # MIT License
 # 
