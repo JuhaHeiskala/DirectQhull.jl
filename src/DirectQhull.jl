@@ -458,7 +458,7 @@ end
 @noinline function qh_get_facet_list(qh::Ptr{qhT}, ::Val{N}) where N
     local ptr
 
-    # this is workaround for Julia crashes that seem to happen if Val(N) has N defined in runtime
+    # for some strange reason Julia crashes without the below if    
     if N==1
         ptr = qh_get_facet_list_ptr(qh, Val(1))
     elseif N==2        
@@ -470,7 +470,7 @@ end
     elseif N==5
         ptr = qh_get_facet_list_ptr(qh, Val(5))
     else
-        error("Too large hull dimension")
+        ptr = qh_get_facet_list_ptr(qh, Val(N))
     end
 
     if ptr != C_NULL
@@ -488,7 +488,7 @@ end
 # GETTER for facet list as Julia QHfacetT type
 @noinline function qh_get_vertex_list(qh::Ptr{qhT}, ::Val{N}) where N
     local ptr
-    # this is workaround for Julia crashes that seem to happen if Val(N) has N defined in runtime
+    # for some strange reason Julia crashes without the below if
     if N==1
         ptr = qh_get_vertex_list_ptr(qh, Val(1))
     elseif N==2        
@@ -500,7 +500,7 @@ end
     elseif N==5
         ptr = qh_get_vertex_list_ptr(qh, Val(5))
     else
-        error("Too large hull dimension")
+        ptr = qh_get_facet_list_ptr(qh, Val(N))
     end
     if ptr != C_NULL
         return unsafe_load(ptr)
