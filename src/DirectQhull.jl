@@ -340,13 +340,15 @@ struct ConvexHull
     volume::QHrealT
     max_bound::Vector{QHrealT}
     min_bound::Vector{QHrealT}
-    
+
+    # pnts are Matrix with dimensions (point_dim, num_points)
+    # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
         qh_ptr = qh_alloc_qh()
 
         pushfirst!(qhull_options, "Qt")
         
-        if size(pnts, 2)>=5
+        if size(pnts, 1)>=5
             push!(qhull_options, "Qx")
         end
 
@@ -358,16 +360,16 @@ struct ConvexHull
         
         hd = qh_get_hull_dim(qh_ptr)
 
-        if hd == 2
-            vertices = qh_get_extremes_2d(qh_ptr)
-        else
-            vertices = unique((vtx)->qh_pointid(qh_ptr, vtx.point_ptr)+1)
-        end
-        
         # collect convex hull points
         # for some reason using hd from above in Val(hd) crashes Julia
         simplices = qh_get_convex_hull_pnts(qh_ptr, Val(size(pnts,1)))
 
+        if hd == 2
+            vertices = qh_get_extremes_2d(qh_ptr)
+        else
+            vertices = unique(simplices)
+        end
+                
         # facet neighbors, equations, good
         neighbors, equations, coplanar, good = qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)))
 
