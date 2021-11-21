@@ -54,8 +54,29 @@ export ConvexHull
 mutable struct qhT
 end
 
+function Base.getproperty(qh_ptr::Ptr{qhT}, fld::Symbol)
+    if fld === :input_dim
+        return qh_get_input_dim(qh_ptr)
+    elseif fld === :hull_dim
+        return qh_get_hull_dim(qh_ptr)
+    elseif fld === :num_facets
+        return qh_get_num_facets(qh_ptr)
+    elseif fld === :num_points
+        return qh_get_num_points(qh_ptr)
+    elseif fld === :facet_list
+        return qh_get_facet_list(qh_ptr, Val(qh_ptr.hull_dim))
+    elseif fld === :vertex_list
+        return qh_get_vertex_list(qh_ptr, Val(qh_ptr.hull_dim))
+    elseif fld === :UPPERdelaunay
+        return qh_get_UPPERdelaunay(qh_ptr)
+    else
+        throw(ErrorException("Unknown qh field"))
+    end
+end
+
 # defines clockwise or counterclockwise orientation e.g. 2d-convex hull vertex ordering
 const qh_ORIENTclock = 0
+const qh_RIDGEall= 0
 
 const qh_lib = Qhull_jll.get_libqhull_r_path()
 
@@ -82,6 +103,7 @@ struct QHsetT{T<:Union{QHintT, Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}}}
                              # /* this may generate a warning since e[] contains  maxsize elements */
     function QHsetT{T}(ptr::Ptr{QHsetT{T}}) where T<:Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}
         max_size = unsafe_load(Ptr{QHintT}(ptr))
+
         # with passing C_NULL as qh_ptr below the call will crash, if the setsize is invalid
         # however, qhull would anyway exit in this case with internal error, though in a more gracious manner
         # (this removes the need to pass the qhT pointer to this constructor)
@@ -346,7 +368,8 @@ struct ConvexHull
     function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
         qh_ptr = qh_alloc_qh()
 
-        pushfirst!(qhull_options, "Qt")
+
+        qhull_options = cat(["Qt", "i"], qhull_options, dims=1)
         
         if size(pnts, 1)>=5
             push!(qhull_options, "Qx")
@@ -394,6 +417,65 @@ struct ConvexHull
     end    
 end
 
+
+
+# build Voronoi regions for a set of points
+struct Voronoi
+    qh_ptr::Ptr{qhT}
+    points::Matrix{QHcoordT}
+    ndim::QHintT
+    vertices::Matrix{QHcoordT}
+    ridge_points::Matrix{QHintT}
+    ridge_vertices::Vector{Vector{QHintT}}
+    regions::Vector{Vector{QHintT}}
+    point_region::Vector{QHintT}
+    max_bound::Vector{QHrealT}
+    min_bound::Vector{QHrealT}
+    
+    # pnts are Matrix with dimensions (point_dim, num_points)
+    # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
+    function Voronoi(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
+        qh_ptr = qh_alloc_qh()
+
+        # build Voronoi regions
+        qhull_options = cat(["v", "Qbb", "Qc", "Qz"], qhull_options, dims=1)
+        #qhull_options = cat(["v", "Qbb"], qhull_options, dims=1) 
+        
+        if size(pnts, 1)>=5
+            push!(qhull_options, "Qx")
+        end
+
+        # make options string
+        qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
+
+        # calculate Voronoi regions
+        res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
+
+        input_dim = qh_get_input_dim(qh_ptr)
+        hd = qh_get_hull_dim(qh_ptr)
+
+        #scipy_voronoi(qh_ptr, Val(qh_ptr.hull_dim))
+        @assert(size(pnts,1)+1 == qh_ptr.hull_dim)
+        voronoi_vertices, ridge_points, ridge_vertices, regions, point_region = get_voronoi_diagram(qh_ptr, size(pnts,2), Val(size(pnts,1)+1))
+
+        # max and min bounds
+        max_bound = maximum(pnts, dims=2)[:]
+        min_bound = minimum(pnts, dims=2)[:]
+        
+        #(F, C, at_inf) = qh_get_voronoi_pnts(qh_ptr, Val(hd))
+        new(qh_ptr, pnts, input_dim, voronoi_vertices, ridge_points, ridge_vertices, regions, point_region, max_bound, min_bound)
+    end
+end
+
+mutable struct RidgesT
+    ridge_error::Union{Nothing, String}
+    nridges::Int
+    ridge_points::Matrix{QHintT}
+    ridge_vertices::Vector{Vector{QHintT}}
+end
+
+
+
 # calculate new convex hull from the given points and Qhull options
 function qh_new_qhull(qh::Ptr{qhT}, pnts::StridedMatrix{Float64}, opts::String)
     ok = ccall((:qh_new_qhull, qh_lib), Cint,
@@ -437,11 +519,30 @@ function qh_setsize(qh::Ptr{qhT}, set::Ptr{QHsetPtrT{T}}) where T<:Union{QHintT,
     ccall((:qh_setsize, qh_lib), Cint, (Ptr{qhT}, Ptr{QHsetPtrT}), qh, set)
 end
 
+# Qhull qh_findgood_all for the given qhT
+function qh_findgood_all(qh::Ptr{qhT}, ::Val{N}) where N
+    ccall((:qh_findgood_all, qh_lib), Cvoid, (Ptr{qhT}, Ptr{QHfacetT}), qh, qh_get_facet_list_ptr(qh, Val(N)))
+end
+
+function qh_setvoronoi_all(qh::Ptr{qhT})
+    ccall((:qh_setvoronoi_all, qh_lib), Cvoid, (Ptr{qhT},), qh)
+end
+
+function qh_order_vertexneighbors(qh::Ptr{qhT}, vtx::Ptr{QHvertexT{N}}) where N
+    ccall((:qh_order_vertexneighbors, qh_lib), Cvoid, (Ptr{qhT}, Ptr{QHvertexT{N}}), qh, vtx)
+end
+
+function qh_eachvoronoi_all(qh::Ptr{qhT}, ridges::RidgesT, visit_f::Ptr{Cvoid},
+                            isUpper::QHboolT, innerouter::QHintT, inorder::QHboolT)
+    ccall((:qh_eachvoronoi_all, qh_lib), QHintT, (Ptr{qhT}, Ref{RidgesT}, Ptr{Cvoid}, QHboolT, QHintT, QHboolT),
+          qh, ridges, visit_f, isUpper, innerouter, inorder)
+end
 
 # GETTER accessors for plain data types
 for (T, getter) in ((:QHintT, :qh_get_hull_dim), (:QHintT, :qh_get_num_facets), (:QHintT, :qh_get_num_points),
                     (:QHintT, :qh_get_num_vertices), (:QHintT, :qh_get_visit_id), (:QHintT, :qh_get_vertex_visit),
-                    (:QHrealT, :qh_get_totarea), (:QHrealT, :qh_get_totvol), (:QHuintT, :qh_get_facet_id))
+                    (:QHrealT, :qh_get_totarea), (:QHrealT, :qh_get_totvol), (:QHuintT, :qh_get_facet_id),
+                    (:QHintT, :qh_get_num_good), (:QHintT, :qh_get_input_dim), (:QHboolT, :qh_get_UPPERdelaunay))
     @eval begin
         function ($getter)(qh::Ptr{qhT})
             ccall(($(QuoteNode(getter)), qh_lib), $T, (Ptr{qhT},), qh)
@@ -480,9 +581,37 @@ end
     end        
 end
 
-# GETTER for facet list pointer
+function qh_facetcenter(qh::Ptr{qhT}, vertices_ptr::Ptr{QHsetT{Ptr{QHvertexT{HD}}}}) where HD
+    center_pnt = ccall((:qh_facetcenter, qh_lib), Ptr{NTuple{HD, QHrealT}},
+                       (Ptr{qhT}, Ptr{QHsetT{Ptr{QHvertexT{HD}}}}), qh, vertices_ptr)
+    if center_pnt != C_NULL
+        return unsafe_load(center_pnt)
+    else
+        return nothing
+    end
+end
+
+# GETTER for vertex list pointer
 function qh_get_vertex_list_ptr(qh::Ptr{qhT}, ::Val{N}) where N
     ccall((:qh_get_vertex_list, qh_lib), Ptr{QHvertexT{N}}, (Ptr{qhT},), qh)
+end
+
+function qh_get_vertex_tail_ptr(qh::Ptr{qhT}, ::Val{N}) where N
+    ccall((:qh_get_vertex_tail, qh_lib), Ptr{QHvertexT{N}}, (Ptr{qhT},), qh)
+end
+
+function qh_get_vertex_tail(qh::Ptr{qhT}, ::Val{N}) where N
+    ptr = qh_get_vertex_tail_ptr(qh, Val(N))
+    if ptr != C_NULL
+        return unsafe_load(ptr)
+    else
+        return nothing
+    end        
+end
+
+# GETTER for facet list pointer
+function qh_get_del_vertices_ptr(qh::Ptr{qhT}) 
+    ccall((:qh_get_del_vertices, qh_lib), Ptr{QHsetT{Ptr{QHvertexT}}}, (Ptr{qhT},), qh)
 end
 
 # GETTER for facet list as Julia QHfacetT type
@@ -584,6 +713,10 @@ function Base.getproperty(fct::QHfacetT{HD}, fld::Symbol) where HD
         return QHboolT( (getfield(fct, :flags)>>12)&1)  # toporient is 13th bit in the flags field
     elseif fld == :simplicial
         return QHboolT( (getfield(fct, :flags)>>13)&1)  # simplicial is 14th bit in the flags field
+    elseif fld == :seen
+        return QHboolT( (getfield(fct, :flags)>>14)&1)  # seen is 15th bit in the flags field
+    elseif fld == :upperdelaunay
+        return QHboolT( (getfield(fct, :flags)>>17)&1)  # upperdelaunay is 18th bit in the flags field
     elseif fld == :good
         return QHboolT( (getfield(fct, :flags)>>19)&1)  # good is 20th bit in the flags field
     else
@@ -593,22 +726,46 @@ end
 
 
 function Base.setproperty!(fct::QHfacetT{HD}, fld::Symbol, value) where HD
-    setfield!(fct, fld, value)
+
+    if fld === :seen
+        fct.flags = getfield(fct, :flags) | (UInt32(1) << 14) # seen is 15th bit of the flags field
+    else
+        setfield!(fct, fld, value)
+    end
     # store back to qhull, pointer to self is obtained (somewhat dangerously) utilizing the facet linked list
     unsafe_store!(fct.self_ptr, fct)
     return value
 end
 
-function Base.getproperty(vtx::QHvertexT, fld::Symbol)
+function Base.getproperty(vtx::QHvertexT{HD}, fld::Symbol) where HD
     if fld === :next
-        ptr = getfield(vtx, :next)
+        ptr = vtx.next_ptr
         if ptr == C_NULL
             return nothing
         else
             return unsafe_load(ptr)
         end
+    elseif fld === :self
+        return unsafe_load(vtx.self_ptr)
+    elseif fld === :self_ptr
+        # ID=0 is dummy vertex, with next=C_NULL
+        # (so the vertex ptr cannot be retrieved in this case)
+        if (vtx.id != 0) 
+            return vtx.next.previous_ptr
+        else
+            throw(ErrorException("Cannot get self pointer for last vertex in vertex list."))
+        end
     elseif fld === :next_ptr
         return getfield(vtx, :next)
+    elseif fld === :previous
+        ptr = vtx.previous_ptr
+        if ptr == C_NULL
+            return nothing
+        else
+            return unsafe_load(ptr)
+        end
+    elseif fld === :previous_ptr
+        return getfield(vtx, :previous)
     elseif fld === :point
         ptr = getfield(vtx, :point)
         if ptr == C_NULL
@@ -618,16 +775,25 @@ function Base.getproperty(vtx::QHvertexT, fld::Symbol)
         end
     elseif fld === :point_ptr
         return getfield(vtx, :point)
+    elseif fld === :neighbors_ptr
+        return Ptr{QHsetT{Ptr{QHfacetT{3}}}}(getfield(vtx, :neighbors))
+    elseif fld === :neighbors
+        ptr=vtx.neighbors_ptr
+        return QHsetT{Ptr{QHfacetT{3}}}(ptr)
     else
         return getfield(vtx, fld)
     end
 end
 
 function Base.setproperty!(vtx::QHvertexT{HD}, fld::Symbol, value) where HD
-    setfield!(vtx, fld, value)
+    if fld === :seen
+        vtx.flags = getfield(vtx, :flags) | UInt8(1) # seen is the first bit of the flags field
+    else
+        setfield!(vtx, fld, value)
+    end
     # store back to qhull, pointer to self is obtained (somewhat dangerously) utilizing the vertex linked list
     if (vtx.id != 0) # ID=0 is dummy vertex, with next=C_NULL (so the vertex cannot be updated in this case)
-        unsafe_store!(vtx.next.previous, vtx)
+        unsafe_store!(vtx.self_ptr, vtx)
     end
 end
 
@@ -677,7 +843,128 @@ function qh_get_convex_hull_vertices(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
     return vertices
 end
 
-# Below functions "qh_get_extremes_2d" and "qh_get_simplex_facet_arrays" are
+# get calculated voroin points as Julia array
+function qh_get_voronoi_pnts(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
+
+    qh_findgood_all(qh_ptr, Val(3))
+
+    num_voronoi_regions = qh_get_num_vertices(qh_ptr) - qh_setsize(qh_ptr, qh_get_del_vertices_ptr(qh_ptr))
+
+    num_voronoi_vertices = qh_get_num_good(qh_ptr)
+    
+    qh_setvoronoi_all(qh_ptr)
+
+    facet = qh_get_facet_list(qh_ptr, Val(3))
+    
+    while facet.id != 0
+        facet.seen = false
+        facet = facet.next
+    end
+
+    ni = zeros(Int, num_voronoi_regions)
+    
+    order_neighbors = qh_get_hull_dim(qh_ptr) == 3
+    k = 1
+    vertex = qh_get_vertex_list(qh_ptr, Val(HD))
+
+    while vertex.id != 0 # id 0 is dummy vertex at the end of vertex list
+        if order_neighbors
+            qh_order_vertexneighbors(qh_ptr, vertex.self_ptr)
+            # reload vertex (above call "qh_order_vertexneighbors(qh_ptr, vtx_ptr)" invalides vertex neighbor set)
+            vertex = vertex.self
+        end
+        
+        infinity_seen = false
+
+        neighborSet = vertex.neighbors
+        for neighbor in neighborSet
+            if neighbor.upperdelaunay != 0
+                if infinity_seen == false
+                    infinity_seen = true
+                    ni[k] += 1
+                end
+            else
+                neighbor.seen = true
+                ni[k] += 1
+            end
+        end
+        k += 1
+
+        vertex = vertex.next
+    end
+    
+    nr = (qh_get_num_points(qh_ptr) > num_voronoi_regions) ? qh_get_num_points(qh_ptr) : num_voronoi_regions
+
+    at_inf = zeros(Bool, nr, 1)
+    F = zeros(num_voronoi_vertices+1, qh_get_input_dim(qh_ptr))
+    F[1, :] .= Inf
+
+    C = Array{Any,2}(undef, nr, 1)
+    fill!(C, Array{Float64,2}(undef,0,0))
+
+    facet = qh_get_facet_list(qh_ptr, Val(HD))
+    for facetI=1:qh_ptr.num_facets
+        facet.seen = false
+        facet = facet.next
+    end
+
+    i = 0
+    k = 1
+
+    vertex = qh_ptr.vertex_list
+    while vertex.id != 0 # id 0 is dummy final vertex of the vertex list
+        if qh_ptr.hull_dim == 3
+            qh_order_vertexneighbors(qh_ptr, vertex.self_ptr)
+            # reload vertex
+            vertex = vertex.self
+        end
+        infinity_seen = false
+        idx = qh_pointid(qh_ptr, vertex.point_ptr)
+        num_vertices = ni[k]
+        k += 1
+
+        if num_vertices == 1
+            continue
+        end
+        facet_list = zeros(Int, num_vertices)
+
+        m = 1
+
+        neighborSet = vertex.neighbors
+        for neighbor in neighborSet
+            if neighbor.upperdelaunay != 0
+                if infinity_seen == 0
+                    infinity_seen = true
+                    facet_list[m] = 1
+                    m += 1
+                    at_inf[idx+1] = true
+                end
+            else
+                if neighbor.seen == false
+                    i += 1
+                    for d = 1:qh.input_dim
+                        F[i+1, d] = neighbor.center[d]
+                    end
+                    neighbor.seen = true
+                    neighbor.visitid = i
+                end
+
+                facet_list[m] = neighbor.visitid + 1
+                m += 1
+            end
+        end
+        C[idx+1] = facet_list
+        vertex = vertex.next
+    end
+
+    return (F, C, at_inf)
+                
+end
+
+
+
+# Below functions "qh_get_extremes_2d", "qh_get_simplex_facet_arrays",
+# "qh_order_vertexneighbors_nd", "get_voronoi_diagram", "visit_voronoi"
 # adapted from Qhull/io.c and Scipy/_qhull.pyx/get_extremes_2d with the
 # below BSD license from _qhull.pyx/Scipy
 #
@@ -861,6 +1148,172 @@ function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
     return (neighbors, equations, coplanar, good)
 end
 
+function visit_voronoi(qh_ptr::Ptr{qhT}, ridges::RidgesT, vertex_ptr::Ptr{QHvertexT{HD}},
+                       vertexA_ptr::Ptr{QHvertexT{HD}},
+                       centers_ptr::Ptr{QHsetT{Ptr{QHfacetT{HD}}}}, unbounded::QHboolT) where HD
+        
+    vertex = unsafe_load(vertex_ptr)
+    vertexA = unsafe_load(vertexA_ptr)
+
+    if !isnothing(ridges.ridge_error)
+        return QHintT(0)
+    end
+
+    if ridges.nridges >= size(ridges.ridge_points, 2)
+        try
+            # The array is guaranteed to be safe to resize
+            ridges.ridge_points = cat(ridges.ridge_points, zeros(QHintT, 2, 2*ridges.nridges + 1), dims=2)
+        catch e
+            ridges.ridge_error = e
+            return QHintT(0)
+        end
+    end
+
+    # Record which points the ridge is between
+    point_1 = qh_pointid(qh_ptr, vertex.point_ptr)
+    point_2 = qh_pointid(qh_ptr, vertexA.point_ptr)
+
+    ridges.nridges += 1
+    ridges.ridge_points[1, ridges.nridges] = point_1
+    ridges.ridge_points[2, ridges.nridges] = point_2
+
+    # Record which voronoi vertices constitute the ridge
+    cur_vertices = Vector{QHintT}(undef, 0)
+
+    centers = QHsetT{Ptr{QHfacetT{HD}}}(centers_ptr)
+
+    for fct in centers
+        ix = fct.visitid - 1
+        append!(cur_vertices, ix)
+    end
+    push!(ridges.ridge_vertices, cur_vertices)
+
+    return QHintT(0)
+end
+
+
+function get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) where HD
+    # -- Grab Voronoi ridges    
+    ridges = RidgesT(nothing, 0, zeros(QHintT, 2, 10), zeros(QHintT, 0))
+
+    local visit_voronoi_c =
+        @cfunction(visit_voronoi, QHintT, (Ptr{qhT}, Ref{RidgesT}, Ptr{QHvertexT{HD}},
+                                           Ptr{QHvertexT{HD}}, Ptr{QHsetT{Ptr{QHfacetT{HD}}}}, QHboolT))
+
+    qh_eachvoronoi_all(qh_ptr, ridges, visit_voronoi_c, qh_ptr.UPPERdelaunay,
+                       QHintT(qh_RIDGEall), QHuintT(1))
+
+    ridge_points = ridges.ridge_points[:, 1:ridges.nridges]
+
+    if !isnothing(ridges.ridge_error)
+        throw(ErrorException(ridges.ridge_error))
+    end
+    
+    # Now, qh_eachvoronoi_all has initialized the visitids of facets
+    # to correspond do the Voronoi vertex indices.
+    
+    # -- Grab Voronoi regions
+    regions = Vector{Vector{QHintT}}(undef, 0)
+    
+    point_region = fill!(Vector{QHintT}(undef, num_input_pnts), -1)
+
+    vertex = qh_ptr.vertex_list
+    while vertex.id != 0 # id 0 is dummy last vertex of the vertex list
+        qh_order_vertexneighbors_nd(qh_ptr, vertex)
+        vertex = vertex.self
+        
+        i = qh_pointid(qh_ptr, vertex.point_ptr)+1
+        if i <= num_input_pnts
+            # Qz results to one extra point
+            point_region[i] = length(regions)
+        end
+        
+        inf_seen = false
+        cur_region = Vector{QHintT}()
+
+        for neighbor in vertex.neighbors
+            i = neighbor.visitid - 1
+            if i == -1
+                if !inf_seen
+                    inf_seen = true
+                else
+                    continue
+                end
+            end
+            append!(cur_region, QHintT(i))
+        end
+
+        if length(cur_region) == 1 && cur_region[1] == -1
+            # report similarly as qvoronoi o
+            cur_region = Vector{QHintT}()
+        end
+
+        push!(regions, cur_region)
+            
+        vertex = vertex.next
+    end
+        
+    # -- Grab Voronoi vertices and point-to-region map
+    nvoronoi_vertices = 0
+    voronoi_vertices = Matrix{QHrealT}(undef, Int(qh_ptr.input_dim), 10)
+    
+    facet = qh_ptr.facet_list
+    dist = Vector{QHrealT}(undef, 1)
+    while facet.id != 0 # id 0 is dummy last facet of the facet list
+        if facet.visitid > 0
+            # finite Voronoi vertex
+            
+            center = qh_facetcenter(qh_ptr, facet.vertices_ptr)
+            
+            nvoronoi_vertices = max(facet.visitid, nvoronoi_vertices)
+            if nvoronoi_vertices > size(voronoi_vertices, 2)
+                # Array is safe to resize
+                voronoi_vertices = cat(voronoi_vertices,
+                                       zeros(QHrealT, qh_ptr.input_dim, 2*nvoronoi_vertices + 1), dims=2)
+            end
+            
+            for k in 1:qh_ptr.input_dim
+                voronoi_vertices[k, facet.visitid] = center[k]
+            end
+                
+            if !isnothing(facet.coplanarset)
+                for k in 1:length(facet.coplanarset.e)
+                    point = facet.coplanarset[k]
+                    vertex = qh_nearvertex(qh_ptr, facet.self_ptr, point.self_ptr, dist)
+                    
+                    i = qh_pointid(qh_ptr, point)
+                    j = qh_pointid(qh_ptr, vertex.point)
+                    
+                    if i <= num_input_pnts
+                        # Qz can result to one extra point
+                        point_region[i] = point_region[j]
+                    end
+                end
+            end
+        end
+        
+        facet = facet.next
+    end
+    
+    voronoi_vertices = voronoi_vertices[:, 1:nvoronoi_vertices]
+    
+    return voronoi_vertices, ridge_points, ridges.ridge_vertices, regions, point_region
+    
+end
+
+function qh_order_vertexneighbors_nd(qh_ptr, vertex::QHvertexT{HD}) where HD
+    if HD == 3
+        qh_order_vertexneighbors(qh_ptr, vertex.self_ptr)
+    elseif HD >= 4
+        error("Unimplemented")
+        #sort(vertex.neighbors.e, length(vertex.neighbors.e), qh_compare_facetvisit)
+    end
+    ()
+end
+
+
+
 
 
 end
+
