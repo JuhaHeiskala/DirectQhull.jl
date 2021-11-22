@@ -67,8 +67,18 @@ function Base.getproperty(qh_ptr::Ptr{qhT}, fld::Symbol)
         return qh_get_facet_list(qh_ptr, Val(qh_ptr.hull_dim))
     elseif fld === :vertex_list
         return qh_get_vertex_list(qh_ptr, Val(qh_ptr.hull_dim))
+    elseif fld === :center_size
+        return qh_get_center_size(qh_ptr)
     elseif fld === :UPPERdelaunay
         return qh_get_UPPERdelaunay(qh_ptr)
+    elseif fld === :SCALElast
+        return qh_get_SCALElast(qh_ptr)
+    elseif fld === :last_low
+        return qh_get_last_low(qh_ptr)
+    elseif fld === :last_high
+        return qh_get_last_high(qh_ptr)
+    elseif fld === :last_newhigh
+        return qh_get_last_newhigh(qh_ptr)
     else
         throw(ErrorException("Unknown qh field"))
     end
@@ -380,6 +390,7 @@ struct ConvexHull
 
         # calculate new qhull
         res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
+        qh_triangulate(qh_ptr)
         
         hd = qh_get_hull_dim(qh_ptr)
 
@@ -394,7 +405,7 @@ struct ConvexHull
         end
                 
         # facet neighbors, equations, good
-        neighbors, equations, coplanar, good = qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)))
+        facets, neighbors, equations, coplanar, good = qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)))
 
         if ("QG" in qhull_options || "QG4" in qhull_options)
             Bool.(good)
@@ -414,6 +425,64 @@ struct ConvexHull
         # the new Qhull value
         new(qh_ptr, pnts, vertices, simplices, neighbors, equations, coplanar,
             good, area, vol, max_bound, min_bound)
+    end    
+end
+
+
+# Build convex hull from a set points
+struct Delaunay
+    qh_ptr::Ptr{qhT}
+    points::Matrix{QHcoordT}
+    vertices::Matrix{QHintT}
+    simplices::Matrix{QHintT}
+    neighbors::Matrix{QHintT}
+    equations::Matrix{QHrealT}
+    coplanar::Matrix{QHintT}
+    good::Vector{QHboolT}
+    max_bound::Vector{QHrealT}
+    min_bound::Vector{QHrealT}
+    paraboloid_scale::QHrealT
+    paraboloid_shift::QHrealT
+    
+    # pnts are Matrix with dimensions (point_dim, num_points)
+    # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
+    function Delaunay(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
+        qh_ptr = qh_alloc_qh()
+
+
+        qhull_options = cat(["d", "Qbb", "Qc", "Qz", "Q12"], qhull_options, dims=1)
+        
+        if size(pnts, 1)>=5
+            push!(qhull_options, "Qx")
+        end
+
+        # make options string
+        qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
+
+        # calculate new qhull
+        res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
+
+        qh_triangulate(qh_ptr)
+        
+        input_dim = qh_ptr.input_dim 
+        hd = qh_get_hull_dim(qh_ptr)
+
+        # facet neighbors, equations, good
+        facets, neighbors, equations, coplanar, good =
+            qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)+1), delaunay=true)
+
+        # calculate total area and volume
+        qh_getarea(qh_ptr, Val(size(pnts,1)))
+
+        # max and min bounds
+        max_bound = maximum(pnts, dims=2)[:]
+        min_bound = minimum(pnts, dims=2)[:]
+
+        paraboloid_scale, paraboloid_shift = get_paraboloid_shift_scale(qh_ptr)
+        
+        # the new Delaunay value
+        new(qh_ptr, pnts, facets, facets, neighbors, equations, coplanar,
+            good, max_bound, min_bound, paraboloid_scale, paraboloid_shift)
     end    
 end
 
@@ -454,19 +523,21 @@ struct Voronoi
         input_dim = qh_get_input_dim(qh_ptr)
         hd = qh_get_hull_dim(qh_ptr)
 
-        #scipy_voronoi(qh_ptr, Val(qh_ptr.hull_dim))
         @assert(size(pnts,1)+1 == qh_ptr.hull_dim)
-        voronoi_vertices, ridge_points, ridge_vertices, regions, point_region = get_voronoi_diagram(qh_ptr, size(pnts,2), Val(size(pnts,1)+1))
+        voronoi_vertices, ridge_points, ridge_vertices, regions, point_region =
+            get_voronoi_diagram(qh_ptr, size(pnts,2), Val(size(pnts,1)+1))
 
         # max and min bounds
         max_bound = maximum(pnts, dims=2)[:]
         min_bound = minimum(pnts, dims=2)[:]
         
         #(F, C, at_inf) = qh_get_voronoi_pnts(qh_ptr, Val(hd))
-        new(qh_ptr, pnts, input_dim, voronoi_vertices, ridge_points, ridge_vertices, regions, point_region, max_bound, min_bound)
+        new(qh_ptr, pnts, input_dim, voronoi_vertices, ridge_points, ridge_vertices,
+            regions, point_region, max_bound, min_bound)
     end
 end
 
+# used to build ridges inside qhull
 mutable struct RidgesT
     ridge_error::Union{Nothing, String}
     nridges::Int
@@ -532,6 +603,10 @@ function qh_order_vertexneighbors(qh::Ptr{qhT}, vtx::Ptr{QHvertexT{N}}) where N
     ccall((:qh_order_vertexneighbors, qh_lib), Cvoid, (Ptr{qhT}, Ptr{QHvertexT{N}}), qh, vtx)
 end
 
+function qh_memfree(qh::Ptr{qhT}, object_ptr::Ptr{T}, insize::QHintT) where T
+    ccall((:qh_memfree, qh_lib), Cvoid, (Ptr{qhT}, Ptr{Cvoid}, QHintT), qh, Ptr{Cvoid}(object_ptr), insize)
+end
+
 function qh_eachvoronoi_all(qh::Ptr{qhT}, ridges::RidgesT, visit_f::Ptr{Cvoid},
                             isUpper::QHboolT, innerouter::QHintT, inorder::QHboolT)
     ccall((:qh_eachvoronoi_all, qh_lib), QHintT, (Ptr{qhT}, Ref{RidgesT}, Ptr{Cvoid}, QHboolT, QHintT, QHboolT),
@@ -542,7 +617,9 @@ end
 for (T, getter) in ((:QHintT, :qh_get_hull_dim), (:QHintT, :qh_get_num_facets), (:QHintT, :qh_get_num_points),
                     (:QHintT, :qh_get_num_vertices), (:QHintT, :qh_get_visit_id), (:QHintT, :qh_get_vertex_visit),
                     (:QHrealT, :qh_get_totarea), (:QHrealT, :qh_get_totvol), (:QHuintT, :qh_get_facet_id),
-                    (:QHintT, :qh_get_num_good), (:QHintT, :qh_get_input_dim), (:QHboolT, :qh_get_UPPERdelaunay))
+                    (:QHintT, :qh_get_num_good), (:QHintT, :qh_get_input_dim), (:QHboolT, :qh_get_UPPERdelaunay),
+                    (:QHintT, :qh_get_center_size), (:QHboolT, :qh_get_SCALElast), (:QHrealT, :qh_get_last_high),
+                    (:QHrealT, :qh_get_last_low), (:QHrealT, :qh_get_last_newhigh))
     @eval begin
         function ($getter)(qh::Ptr{qhT})
             ccall(($(QuoteNode(getter)), qh_lib), $T, (Ptr{qhT},), qh)
@@ -581,11 +658,15 @@ end
     end        
 end
 
-function qh_facetcenter(qh::Ptr{qhT}, vertices_ptr::Ptr{QHsetT{Ptr{QHvertexT{HD}}}}) where HD
+function qh_facetcenter(qh::Ptr{qhT}, vertices_ptr::Ptr{QHsetT{Ptr{QHvertexT{HD}}}}; free_after_load::Bool=false) where HD
     center_pnt = ccall((:qh_facetcenter, qh_lib), Ptr{NTuple{HD, QHrealT}},
                        (Ptr{qhT}, Ptr{QHsetT{Ptr{QHvertexT{HD}}}}), qh, vertices_ptr)
     if center_pnt != C_NULL
-        return unsafe_load(center_pnt)
+        center = unsafe_load(center_pnt)
+        if free_after_load
+            qh_memfree(qh, center_pnt, qh.center_size)
+        end
+        return center
     else
         return nothing
     end
@@ -964,9 +1045,9 @@ end
 
 
 # Below functions "qh_get_extremes_2d", "qh_get_simplex_facet_arrays",
-# "qh_order_vertexneighbors_nd", "get_voronoi_diagram", "visit_voronoi"
-# adapted from Qhull/io.c and Scipy/_qhull.pyx/get_extremes_2d with the
-# below BSD license from _qhull.pyx/Scipy
+# "qh_order_vertexneighbors_nd", "get_voronoi_diagram", "visit_voronoi",
+# "get_paraboloid_scale" are adapted from Qhull/io.c and
+# Scipy/_qhull.pyx/get_extremes_2d with the below BSD license from _qhull.pyx/Scipy
 #
 # Copyright (C)  Pauli Virtanen, 2010.
 #
@@ -1029,7 +1110,7 @@ function qh_get_extremes_2d(qh_ptr::Ptr{qhT})
     n_extremes = 0
 
     # get first facet in facet list
-    facet = qh_get_facet_list(qh_ptr, Val(qh_get_hull_dim(qh_ptr)))
+    facet = qh_get_facet_list(qh_ptr, Val(qh_ptr.hull_dim))
     
     # use facet id instead of pointer comparision for ending the while loop
     start_facet_id = facet.id
@@ -1053,7 +1134,7 @@ function qh_get_extremes_2d(qh_ptr::Ptr{qhT})
         if n_extremes + 2 > length(extremes)
             resize!(extremes, 2*length(extremes)+1)
         end
-        if facet.visitid != 0  # qhull has this check, Scipy does not
+#        if facet.visitid != 0  # qhull has this check, Scipy does not
             if (vertexA.visitid != qh_vertex_visit)
                 # this updates also internal qhull vertex state
                 vertexA.visitid = QHuintT(qh_vertex_visit)
@@ -1065,7 +1146,7 @@ function qh_get_extremes_2d(qh_ptr::Ptr{qhT})
                 n_extremes += 1            
                 extremes[n_extremes] = qh_pointid(qh_ptr, vertexB.point_ptr) + 1 # +1 to change to 1-based index
             end
-        end
+ #       end
         # this updates also internal qhull facet state
         facet.visitid = QHuintT(qh_visit_id);
         facet = nextfacet
@@ -1080,25 +1161,26 @@ function qh_get_extremes_2d(qh_ptr::Ptr{qhT})
 end
 
 # get calculated convex hull points as Julia Int Array
-function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
-    n_facets = qh_get_num_facets(qh_ptr)
-    
+function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}; delaunay=false) where HD
     facet_list = qh_get_facet_list(qh_ptr, Val(HD))
     
     id_map = fill!(Vector{QHintT}(undef, qh_get_facet_id(qh_ptr)), QHintT(-1))
 
     j = 1 # 1 based index in Julia
     for facet in facet_list
-        if (facet.simplicial != 0) &&
-            (length(facet.vertices) != HD) || (length(facet.neighbors) != HD)
-            throw(ErrorException("Non-simplical facet encountered."))
+        if !delaunay || facet.upperdelaunay == qh_ptr.UPPERdelaunay
+            if (facet.simplicial == 0) &&
+                ((length(facet.vertices) != HD) || (length(facet.neighbors) != HD))
+                throw(ErrorException("Non-simplical facet encountered."))
+            end
+            id_map[facet.id] = j
+            j += 1
         end
-        id_map[facet.id] = j
-        j += 1
     end
-    
+
+    n_facets = j-1
     # facet neighors
-    neighbors = Matrix{QHuintT}(undef, HD, n_facets)
+    neighbors = Matrix{QHintT}(undef, HD, n_facets)
     facets = Matrix{QHintT}(undef, HD, n_facets)
     good = Vector{QHintT}(undef, n_facets)
     equations = Matrix{QHrealT}(undef, HD+1, n_facets)
@@ -1107,12 +1189,39 @@ function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
     
     facet_ix = 1
     for facet in facet_list
+
+        if delaunay && (facet.upperdelaunay != qh_ptr.UPPERdelaunay)
+            continue
+        end
+        
         neighborSet = facet.neighbors
 
-        neighbor_ix = 1
-        for neighbor in neighborSet            
-            neighbors[neighbor_ix, facet_ix] = id_map[neighbor.id]
-            neighbor_ix+=1
+        lower_bound = 1
+
+        if delaunay && facet.toporient == qh_ORIENTclock HD == 3
+            # Swap the first and second indices to maintain a
+            # counter-clockwise orientation.
+            for i in 1:2
+                # Save the vertex info
+                swapped_index =  i==1 ? 2 : 1
+                vertex = facet.vertices[i]
+                ipoint = qh_pointid(qh_ptr, vertex.point_ptr)
+                facets[swapped_index, facet_ix] = ipoint + 1
+                
+                # Save the neighbor info
+                neighbor = facet.neighbors[i]
+                neighbors[swapped_index, facet_ix] = id_map[neighbor.id]
+            end
+            lower_bound = 3
+        end
+                        
+        for dim in lower_bound:HD
+            vertex = facet.vertices[dim]
+            ipoint = qh_pointid(qh_ptr, vertex.point_ptr)
+            facets[dim, facet_ix] = ipoint+1
+            
+            neighbor = neighborSet[dim]
+            neighbors[dim, facet_ix] = id_map[neighbor.id]
         end
 
         for ix in 1:HD
@@ -1128,7 +1237,7 @@ function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
                 vertex = unsafe_load(qh_nearvertex(qh_ptr, facet.self_ptr, point_ptr, dist))
                 if ncoplanar >= size(coplanar, 1)
                     # The array is always safe to resize
-                    coplanar = cat(coplanar, zeros(QHintT, ncoplanar + 1, 3), dims=1)
+                    coplanar = cat(coplanar, zeros(QHintT, ncoplanar + 1, HD+1), dims=1)
                 end
                 coplanar[ncoplanar, 1] = qh_pointid(qh_ptr, point_ptr)
                 coplanar[ncoplanar, 2] = id_map[facet.id]
@@ -1145,7 +1254,7 @@ function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
     # resize
     coplanar = coplanar[1:ncoplanar-1, :]
     
-    return (neighbors, equations, coplanar, good)
+    return (facets, neighbors, equations, coplanar, good)
 end
 
 function visit_voronoi(qh_ptr::Ptr{qhT}, ridges::RidgesT, vertex_ptr::Ptr{QHvertexT{HD}},
@@ -1263,7 +1372,7 @@ function get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) where 
         if facet.visitid > 0
             # finite Voronoi vertex
             
-            center = qh_facetcenter(qh_ptr, facet.vertices_ptr)
+            center = qh_facetcenter(qh_ptr, facet.vertices_ptr, free_after_load=true)
             
             nvoronoi_vertices = max(facet.visitid, nvoronoi_vertices)
             if nvoronoi_vertices > size(voronoi_vertices, 2)
@@ -1275,7 +1384,7 @@ function get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) where 
             for k in 1:qh_ptr.input_dim
                 voronoi_vertices[k, facet.visitid] = center[k]
             end
-                
+            
             if !isnothing(facet.coplanarset)
                 for k in 1:length(facet.coplanarset.e)
                     point = facet.coplanarset[k]
@@ -1301,7 +1410,7 @@ function get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) where 
     
 end
 
-function qh_order_vertexneighbors_nd(qh_ptr, vertex::QHvertexT{HD}) where HD
+function qh_order_vertexneighbors_nd(qh_ptr::Ptr{qhT}, vertex::QHvertexT{HD}) where HD
     if HD == 3
         qh_order_vertexneighbors(qh_ptr, vertex.self_ptr)
     elseif HD >= 4
@@ -1311,9 +1420,19 @@ function qh_order_vertexneighbors_nd(qh_ptr, vertex::QHvertexT{HD}) where HD
     ()
 end
 
-
-
-
-
+function get_paraboloid_shift_scale(qh_ptr::Ptr{qhT})
+    local paraboloid_scale
+    local paraboloid_shift
+    
+    if qh_ptr.SCALElast != 0
+        paraboloid_scale = qh_ptr.last_newhigh / (qh_ptr.last_high - qh_ptr.last_low)
+        paraboloid_shift = -qh_ptr.last_low * paraboloid_scale
+    else
+        paraboloid_scale = 1.0
+        paraboloid_shift = 0.0
+    end
+    
+    return paraboloid_scale, paraboloid_shift
 end
 
+end
