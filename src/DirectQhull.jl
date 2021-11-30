@@ -48,11 +48,12 @@ QHdoubleT = Cdouble
 QHvoidT = Cvoid
 QHfileT = Cvoid
 
-export ConvexHull
+export ConvexHull, Voronoi, Delaunay, HalfspaceIntersection
 
 # holds pointer to qhT structure
 mutable struct qhT
 end
+
 
 function Base.getproperty(qh_ptr::Ptr{qhT}, fld::Symbol)
     if fld === :input_dim
@@ -79,6 +80,8 @@ function Base.getproperty(qh_ptr::Ptr{qhT}, fld::Symbol)
         return qh_get_last_high(qh_ptr)
     elseif fld === :last_newhigh
         return qh_get_last_newhigh(qh_ptr)
+    elseif fld === :first_point_ptr
+        return qh_get_first_point_ptr(qh_ptr)
     else
         throw(ErrorException("Unknown qh field"))
     end
@@ -478,7 +481,7 @@ struct Delaunay
         max_bound = maximum(pnts, dims=2)[:]
         min_bound = minimum(pnts, dims=2)[:]
 
-        paraboloid_scale, paraboloid_shift = get_paraboloid_shift_scale(qh_ptr)
+        paraboloid_scale, paraboloid_shift = qh_get_paraboloid_shift_scale(qh_ptr)
         
         # the new Delaunay value
         new(qh_ptr, pnts, facets, facets, neighbors, equations, coplanar,
@@ -525,7 +528,7 @@ struct Voronoi
 
         @assert(size(pnts,1)+1 == qh_ptr.hull_dim)
         voronoi_vertices, ridge_points, ridge_vertices, regions, point_region =
-            get_voronoi_diagram(qh_ptr, size(pnts,2), Val(size(pnts,1)+1))
+            qh_get_voronoi_diagram(qh_ptr, size(pnts,2), Val(size(pnts,1)+1))
 
         # max and min bounds
         max_bound = maximum(pnts, dims=2)[:]
@@ -534,6 +537,66 @@ struct Voronoi
         #(F, C, at_inf) = qh_get_voronoi_pnts(qh_ptr, Val(hd))
         new(qh_ptr, pnts, input_dim, voronoi_vertices, ridge_points, ridge_vertices,
             regions, point_region, max_bound, min_bound)
+    end
+end
+
+# build Voronoi regions for a set of points
+struct HalfspaceIntersection
+    qh_ptr::Ptr{qhT}
+    halfspaces::Matrix{QHcoordT}
+    interior_point::Vector{QHrealT}
+    ndim::QHintT
+    intersections::Matrix{QHcoordT}
+    dual_points::Matrix{QHcoordT}
+    dual_facets::Vector{Vector{QHintT}}
+    dual_vertices::Vector{QHintT}
+    dual_equations::Matrix{QHcoordT}
+    dual_area::QHrealT
+    dual_volume::QHrealT
+    
+    # halfspaces are Matrix with dimensions (n_in_eqs, ndim+1)
+    # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
+    function HalfspaceIntersection(halfspaces::Matrix{QHcoordT}, interior_point::Vector{QHcoordT},
+                                    qhull_options::Vector{String}=Vector{String}())
+        qh_ptr = qh_alloc_qh()
+
+        # build Halfspace intersections
+        hs_mode = foldl((l,r)->l*","*string(r), interior_point[2:end], init="H"*string(interior_point[1]))
+        qhull_options = cat(hs_mode, qhull_options, dims=1)
+        #qhull_options = cat(["v", "Qbb"], qhull_options, dims=1) 
+        
+        if size(halfspaces, 1)>=6
+            push!(qhull_options, "Qx")
+        end
+
+        # make options string
+        qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
+
+        # calculate halfspace intersections
+        res = qh_new_qhull(qh_ptr, halfspaces, qh_opts_str)
+
+        input_dim = qh_get_input_dim(qh_ptr)
+        hd = qh_get_hull_dim(qh_ptr)
+
+        dual_fcts, dual_eqs = qh_get_hull_facets(qh_ptr)
+        dual_pnts = qh_get_hull_points(qh_ptr)
+        
+        intersections = dual_eqs[1:end-1, :] ./ (-dual_eqs[1:end-1, :]) .+ interior_point
+        
+        if hd == 2
+            vertices = qh_get_extremes_2d(qh_ptr)
+        else
+            vertices = Matrix{QHcoordT}()
+        end
+
+        # calculate total area and volume
+        qh_getarea(qh_ptr, Val(hd))
+        area = qh_get_totarea(qh_ptr)
+        vol = qh_get_totvol(qh_ptr)
+
+        
+        new(qh_ptr, halfspaces, interior_point, hd, intersections, dual_pnts,
+            dual_fcts, vertices, dual_eqs, area, vol)
     end
 end
 
@@ -619,7 +682,7 @@ for (T, getter) in ((:QHintT, :qh_get_hull_dim), (:QHintT, :qh_get_num_facets), 
                     (:QHrealT, :qh_get_totarea), (:QHrealT, :qh_get_totvol), (:QHuintT, :qh_get_facet_id),
                     (:QHintT, :qh_get_num_good), (:QHintT, :qh_get_input_dim), (:QHboolT, :qh_get_UPPERdelaunay),
                     (:QHintT, :qh_get_center_size), (:QHboolT, :qh_get_SCALElast), (:QHrealT, :qh_get_last_high),
-                    (:QHrealT, :qh_get_last_low), (:QHrealT, :qh_get_last_newhigh))
+                    (:QHrealT, :qh_get_last_low), (:QHrealT, :qh_get_last_newhigh), (:QHintT, :qh_get_num_visible))
     @eval begin
         function ($getter)(qh::Ptr{qhT})
             ccall(($(QuoteNode(getter)), qh_lib), $T, (Ptr{qhT},), qh)
@@ -630,6 +693,11 @@ end
 # GETTER for facet list pointer
 function qh_get_facet_list_ptr(qh::Ptr{qhT}, ::Val{N}) where N
     ccall((:qh_get_facet_list, qh_lib), Ptr{QHfacetT{N}}, (Ptr{qhT},), qh)
+end
+
+# GETTER for first point of points array
+function qh_get_first_point_ptr(qh::Ptr{qhT})
+    ccall((:qh_get_first_point, qh_lib), Ptr{QHcoordT}, (Ptr{qhT},), qh)
 end
 
 # GETTER for facet list as Julia QHfacetT type
@@ -1045,8 +1113,8 @@ end
 
 
 # Below functions "qh_get_extremes_2d", "qh_get_simplex_facet_arrays",
-# "qh_order_vertexneighbors_nd", "get_voronoi_diagram", "visit_voronoi",
-# "get_paraboloid_scale" are adapted from Qhull/io.c and
+# "qh_order_vertexneighbors_nd", "qh_get_voronoi_diagram", "qh_visit_voronoi",
+# "qh_get_paraboloid_scale" are adapted from Qhull/io.c and
 # Scipy/_qhull.pyx/get_extremes_2d with the below BSD license from _qhull.pyx/Scipy
 #
 # Copyright (C)  Pauli Virtanen, 2010.
@@ -1257,7 +1325,7 @@ function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}; delaunay=false
     return (facets, neighbors, equations, coplanar, good)
 end
 
-function visit_voronoi(qh_ptr::Ptr{qhT}, ridges::RidgesT, vertex_ptr::Ptr{QHvertexT{HD}},
+function qh_visit_voronoi(qh_ptr::Ptr{qhT}, ridges::RidgesT, vertex_ptr::Ptr{QHvertexT{HD}},
                        vertexA_ptr::Ptr{QHvertexT{HD}},
                        centers_ptr::Ptr{QHsetT{Ptr{QHfacetT{HD}}}}, unbounded::QHboolT) where HD
         
@@ -1301,12 +1369,12 @@ function visit_voronoi(qh_ptr::Ptr{qhT}, ridges::RidgesT, vertex_ptr::Ptr{QHvert
 end
 
 
-function get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) where HD
+function qh_get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) where HD
     # -- Grab Voronoi ridges    
     ridges = RidgesT(nothing, 0, zeros(QHintT, 2, 10), zeros(QHintT, 0))
 
     local visit_voronoi_c =
-        @cfunction(visit_voronoi, QHintT, (Ptr{qhT}, Ref{RidgesT}, Ptr{QHvertexT{HD}},
+        @cfunction(qh_visit_voronoi, QHintT, (Ptr{qhT}, Ref{RidgesT}, Ptr{QHvertexT{HD}},
                                            Ptr{QHvertexT{HD}}, Ptr{QHsetT{Ptr{QHfacetT{HD}}}}, QHboolT))
 
     qh_eachvoronoi_all(qh_ptr, ridges, visit_voronoi_c, qh_ptr.UPPERdelaunay,
@@ -1420,7 +1488,7 @@ function qh_order_vertexneighbors_nd(qh_ptr::Ptr{qhT}, vertex::QHvertexT{HD}) wh
     ()
 end
 
-function get_paraboloid_shift_scale(qh_ptr::Ptr{qhT})
+function qh_get_paraboloid_shift_scale(qh_ptr::Ptr{qhT})
     local paraboloid_scale
     local paraboloid_shift
     
@@ -1433,6 +1501,51 @@ function get_paraboloid_shift_scale(qh_ptr::Ptr{qhT})
     end
     
     return paraboloid_scale, paraboloid_shift
+end
+
+function qh_get_hull_facets(qh_ptr::Ptr{qhT})
+    facet_ndim = qh_ptr.hull_dim       
+    
+    num_fcts = qh_get_num_facets(qh_ptr) - qh_get_num_visible(qh_ptr)
+
+    equations = zeros(QHcoordT, facet_ndim+1, num_fcts)
+
+    facets = Vector{Vector{QHintT}}()
+
+    i=1
+    facet = qh_get_facet_list(qh_ptr, Val(qh_ptr.hull_dim))
+
+    while facet.id != 0
+        facetsi = Vector{QHintT}()
+
+        for j = 1:facet_ndim
+            equations[j, i] = facet.normal[j]
+        end
+        equations[facet_ndim+1, i] = facet.offset
+        
+        for vtx in facet.vertices
+            ipoint = qh_pointid(qh_ptr, vtx.point_ptr)+1
+            push!(facetsi, ipoint)
+        end
+
+        i+=1
+        push!(facets, facetsi)
+        facet = facet.next
+    end
+
+    return facets, equations
+end
+
+function qh_get_hull_points(qh_ptr::Ptr{qhT})
+    point_ndim = qh_ptr.hull_dim    
+
+    num_points = qh_get_num_points(qh_ptr)
+    
+    points = Array{QHcoordT}(undef, point_ndim, num_points)
+
+    unsafe_copyto!(pointer(points), qh_ptr.first_point_ptr, point_ndim*num_points)
+
+    return points
 end
 
 end
