@@ -375,7 +375,9 @@ struct ConvexHull
     # pnts are Matrix with dimensions (point_dim, num_points)
     # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
-        @assert(size(pnts,1)>1, "qhull requires 2D or higher input")
+        if size(pnts,1) < 2
+            error("qhull requires 2D or higher input")
+        end
         qh_ptr = qh_alloc_qh()
 
         qhull_options = cat(["Qt", "i"], qhull_options, dims=1)
@@ -503,7 +505,9 @@ struct Voronoi
     # pnts are Matrix with dimensions (point_dim, num_points)
     # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function Voronoi(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
-        @assert(size(pnts,1)>1, "qhull requires 2D or higher input")
+        if size(pnts,1) < 2
+            error("qhull requires 2D or higher input")
+        end
         
         qh_ptr = qh_alloc_qh()
 
