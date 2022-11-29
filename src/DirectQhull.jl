@@ -2,7 +2,7 @@ module DirectQhull
 
 # MIT License
 # 
-# Copyright (c) 2021 Juha Tapio Heiskala
+# Copyright (c) 2022 Juha Tapio Heiskala
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -375,8 +375,8 @@ struct ConvexHull
     # pnts are Matrix with dimensions (point_dim, num_points)
     # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
+        @assert(size(pnts,1)>1, "qhull requires 2D or higher input")
         qh_ptr = qh_alloc_qh()
-
 
         qhull_options = cat(["Qt", "i"], qhull_options, dims=1)
         
@@ -503,6 +503,8 @@ struct Voronoi
     # pnts are Matrix with dimensions (point_dim, num_points)
     # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function Voronoi(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
+        @assert(size(pnts,1)>1, "qhull requires 2D or higher input")
+        
         qh_ptr = qh_alloc_qh()
 
         # build Voronoi regions
