@@ -34,25 +34,24 @@ import Base.length
 
 # define Qhull types
 
-QHboolT = Cuint
-QHrealT = Cdouble
-QHcoordT = QHrealT
-QHpointT = QHcoordT
-QHintT = Cint 
-QHprintT = Cint
-QHcharT = Cchar
-QHuintT = Cuint
-QHulongT = Culong
-QHcenterT = Cint
-QHdoubleT = Cdouble
-QHvoidT = Cvoid
-QHfileT = Cvoid
+const QHboolT = Cuint
+const QHrealT = Cdouble
+const QHcoordT = QHrealT
+const QHpointT = QHcoordT
+const QHintT = Cint 
+const QHprintT = Cint
+const QHcharT = Cchar
+const QHuintT = Cuint
+const QHulongT = Culong
+const QHcenterT = Cint
+const QHdoubleT = Cdouble
+const QHvoidT = Cvoid
+const QHfileT = Cvoid
 
 export ConvexHull, Voronoi, Delaunay, HalfspaceIntersection
 
 # holds pointer to qhT structure
-mutable struct qhT
-end
+mutable struct qhT end
 
 
 function Base.getproperty(qh_ptr::Ptr{qhT}, fld::Symbol)
@@ -89,7 +88,7 @@ end
 
 # defines clockwise or counterclockwise orientation e.g. 2d-convex hull vertex ordering
 const qh_ORIENTclock = 0
-const qh_RIDGEall= 0
+const qh_RIDGEall = 0
 
 const qh_lib = Qhull_jll.get_libqhull_r_path()
 
@@ -156,13 +155,10 @@ struct QHsetPtrT{T<:Union{QHintT, Ptr{<:Union{QHsetelemT, NTuple, QHpointT}}}}
 end
 
 function Base.getindex(set::QHsetPtrT{T}, idx::Int) where T<:Union{QHintT, Ptr{<:QHsetelemT}}
-    ptr = set.e[idx]
-    ptr
+    set.e[idx]
 end
 
-function Base.length(set::QHsetPtrT{T}) where T<:Union{QHintT, Ptr{<:QHsetelemT}}
-    return length(set.e)
-end
+Base.length(set::QHsetPtrT{T}) where T<:Union{QHintT, Ptr{<:QHsetelemT}} = length(set.e)
 
 
 # Qhull vertex type
@@ -633,7 +629,7 @@ function qh_pointid(qh::Ptr{qhT}, pnt::Ptr{NTuple{N, QHpointT}}) where N
                (Ptr{qhT}, Ptr{QHpointT}), qh, pnt)
     return id
 end
-function qh_pointid(qh::Ptr{qhT}, pnt::Ptr{QHpointT}) where N
+function qh_pointid(qh::Ptr{qhT}, pnt::Ptr{QHpointT})
     id = ccall((:qh_pointid, qh_lib), Cuint,
                (Ptr{qhT}, Ptr{QHpointT}), qh, pnt)
     return id
@@ -1485,7 +1481,6 @@ function qh_order_vertexneighbors_nd(qh_ptr::Ptr{qhT}, vertex::QHvertexT{HD}) wh
         error("Unimplemented")
         #sort(vertex.neighbors.e, length(vertex.neighbors.e), qh_compare_facetvisit)
     end
-    ()
 end
 
 function qh_get_paraboloid_shift_scale(qh_ptr::Ptr{qhT})
