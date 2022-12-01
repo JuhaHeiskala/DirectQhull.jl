@@ -1481,12 +1481,8 @@ function qh_get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) whe
 end
 
 function qh_order_vertexneighbors_nd(qh_ptr::Ptr{qhT}, vertex::QHvertexT{HD}) where HD
-    if HD == 3
-        qh_order_vertexneighbors(qh_ptr, vertex.self_ptr)
-    elseif HD >= 4
-        error("Unimplemented")
-        #sort(vertex.neighbors.e, length(vertex.neighbors.e), qh_compare_facetvisit)
-    end
+    qh_order_vertexneighbors(qh_ptr, vertex.self_ptr)
+    ()
 end
 
 function qh_get_paraboloid_shift_scale(qh_ptr::Ptr{qhT})
