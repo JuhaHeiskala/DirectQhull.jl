@@ -53,7 +53,6 @@ export ConvexHull, Voronoi, Delaunay, HalfspaceIntersection
 # holds pointer to qhT structure
 mutable struct qhT end
 
-
 function Base.getproperty(qh_ptr::Ptr{qhT}, fld::Symbol)
     if fld === :input_dim
         return qh_get_input_dim(qh_ptr)
@@ -359,7 +358,6 @@ end
 
 # Build convex hull from a set points
 struct ConvexHull
-    qh_ptr::Ptr{qhT}
     points::Matrix{QHcoordT}
     vertices::Vector{QHuintT}
     simplices::Matrix{QHuintT}
@@ -378,61 +376,61 @@ struct ConvexHull
         if size(pnts,1) < 2
             error("qhull requires 2D or higher input")
         end
-        qh_ptr = qh_alloc_qh()
+        qhullptr() do qh_ptr # qh_ptr is valid until the end of this 
 
-        qhull_options = cat(["Qt", "i"], qhull_options, dims=1)
-        
-        if size(pnts, 1)>=5
-            push!(qhull_options, "Qx")
-        end
+            qhull_options = cat(["Qt", "i"], qhull_options, dims=1)
+            
+            if size(pnts, 1)>=5
+                push!(qhull_options, "Qx")
+            end
 
-        # make options string
-        qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
+            # make options string
+            qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
 
-        # calculate new qhull
-        res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
-        qh_triangulate(qh_ptr)
-        
-        hd = qh_get_hull_dim(qh_ptr)
+            # calculate new qhull
+            res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
+            qh_triangulate(qh_ptr)
+            
+            hd = qh_get_hull_dim(qh_ptr)
 
-        # collect convex hull points
-        # for some reason using hd from above in Val(hd) crashes Julia
-        simplices = qh_get_convex_hull_pnts(qh_ptr, Val(size(pnts,1)))
+            # collect convex hull points
+            # for some reason using hd from above in Val(hd) crashes Julia
+            simplices = qh_get_convex_hull_pnts(qh_ptr, Val(size(pnts,1)))
 
-        if hd == 2
-            vertices = qh_get_extremes_2d(qh_ptr)
-        else
-            vertices = unique(simplices)
-        end
-                
-        # facet neighbors, equations, good
-        facets, neighbors, equations, coplanar, good = qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)))
+            if hd == 2
+                vertices = qh_get_extremes_2d(qh_ptr)
+            else
+                vertices = unique(simplices)
+            end
+                    
+            # facet neighbors, equations, good
+            facets, neighbors, equations, coplanar, good = qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)))
 
-        if ("QG" in qhull_options || "QG4" in qhull_options)
-            Bool.(good)
-        else
-            good = Vector{QHboolT}()
-        end
-        
-        # calculate total area and volume
-        qh_getarea(qh_ptr, Val(size(pnts,1)))
-        area = qh_get_totarea(qh_ptr)
-        vol = qh_get_totvol(qh_ptr)
+            if ("QG" in qhull_options || "QG4" in qhull_options)
+                Bool.(good)
+            else
+                good = Vector{QHboolT}()
+            end
+            
+            # calculate total area and volume
+            qh_getarea(qh_ptr, Val(size(pnts,1)))
+            area = qh_get_totarea(qh_ptr)
+            vol = qh_get_totvol(qh_ptr)
 
-        # max and min bounds
-        max_bound = maximum(pnts, dims=2)[:]
-        min_bound = minimum(pnts, dims=2)[:]
+            # max and min bounds
+            max_bound = maximum(pnts, dims=2)[:]
+            min_bound = minimum(pnts, dims=2)[:]
 
-        # the new Qhull value
-        new(qh_ptr, pnts, vertices, simplices, neighbors, equations, coplanar,
-            good, area, vol, max_bound, min_bound)
+            # the new Qhull value
+            new(pnts, vertices, simplices, neighbors, equations, coplanar,
+                good, area, vol, max_bound, min_bound)
+        end 
     end    
 end
 
 
 # Build convex hull from a set points
 struct Delaunay
-    qh_ptr::Ptr{qhT}
     points::Matrix{QHcoordT}
     vertices::Matrix{QHintT}
     simplices::Matrix{QHintT}
@@ -448,42 +446,42 @@ struct Delaunay
     # pnts are Matrix with dimensions (point_dim, num_points)
     # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function Delaunay(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
-        qh_ptr = qh_alloc_qh()
+        qhullptr() do qh_ptr 
 
+            qhull_options = cat(["d", "Qbb", "Qc", "Qz", "Q12"], qhull_options, dims=1)
+            
+            if size(pnts, 1)>=5
+                push!(qhull_options, "Qx")
+            end
 
-        qhull_options = cat(["d", "Qbb", "Qc", "Qz", "Q12"], qhull_options, dims=1)
+            # make options string
+            qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
+
+            # calculate new qhull
+            res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
+
+            qh_triangulate(qh_ptr)
+            
+            input_dim = qh_ptr.input_dim 
+            hd = qh_get_hull_dim(qh_ptr)
+
+            # facet neighbors, equations, good
+            facets, neighbors, equations, coplanar, good =
+                qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)+1), delaunay=true)
+
+            # calculate total area and volume
+            qh_getarea(qh_ptr, Val(size(pnts,1)))
+
+            # max and min bounds
+            max_bound = maximum(pnts, dims=2)[:]
+            min_bound = minimum(pnts, dims=2)[:]
+
+            paraboloid_scale, paraboloid_shift = qh_get_paraboloid_shift_scale(qh_ptr)
         
-        if size(pnts, 1)>=5
-            push!(qhull_options, "Qx")
-        end
-
-        # make options string
-        qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
-
-        # calculate new qhull
-        res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
-
-        qh_triangulate(qh_ptr)
-        
-        input_dim = qh_ptr.input_dim 
-        hd = qh_get_hull_dim(qh_ptr)
-
-        # facet neighbors, equations, good
-        facets, neighbors, equations, coplanar, good =
-            qh_get_simplex_facet_arrays(qh_ptr, Val(size(pnts,1)+1), delaunay=true)
-
-        # calculate total area and volume
-        qh_getarea(qh_ptr, Val(size(pnts,1)))
-
-        # max and min bounds
-        max_bound = maximum(pnts, dims=2)[:]
-        min_bound = minimum(pnts, dims=2)[:]
-
-        paraboloid_scale, paraboloid_shift = qh_get_paraboloid_shift_scale(qh_ptr)
-        
-        # the new Delaunay value
-        new(qh_ptr, pnts, facets, facets, neighbors, equations, coplanar,
-            good, max_bound, min_bound, paraboloid_scale, paraboloid_shift)
+            # the new Delaunay value
+            new(pnts, facets, facets, neighbors, equations, coplanar,
+                good, max_bound, min_bound, paraboloid_scale, paraboloid_shift)
+        end 
     end    
 end
 
@@ -491,7 +489,6 @@ end
 
 # build Voronoi regions for a set of points
 struct Voronoi
-    qh_ptr::Ptr{qhT}
     points::Matrix{QHcoordT}
     ndim::QHintT
     vertices::Matrix{QHcoordT}
@@ -509,42 +506,42 @@ struct Voronoi
             error("qhull requires 2D or higher input")
         end
         
-        qh_ptr = qh_alloc_qh()
+        qhullptr() do qh_ptr 
 
-        # build Voronoi regions
-        qhull_options = cat(["v", "Qbb", "Qc", "Qz"], qhull_options, dims=1)
-        #qhull_options = cat(["v", "Qbb"], qhull_options, dims=1) 
-        
-        if size(pnts, 1)>=5
-            push!(qhull_options, "Qx")
-        end
+            # build Voronoi regions
+            qhull_options = cat(["v", "Qbb", "Qc", "Qz"], qhull_options, dims=1)
+            #qhull_options = cat(["v", "Qbb"], qhull_options, dims=1) 
+            
+            if size(pnts, 1)>=5
+                push!(qhull_options, "Qx")
+            end
 
-        # make options string
-        qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
+            # make options string
+            qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
 
-        # calculate Voronoi regions
-        res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
+            # calculate Voronoi regions
+            res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
 
-        input_dim = qh_get_input_dim(qh_ptr)
-        hd = qh_get_hull_dim(qh_ptr)
+            input_dim = qh_get_input_dim(qh_ptr)
+            hd = qh_get_hull_dim(qh_ptr)
 
-        @assert(size(pnts,1)+1 == qh_ptr.hull_dim)
-        voronoi_vertices, ridge_points, ridge_vertices, regions, point_region =
-            qh_get_voronoi_diagram(qh_ptr, size(pnts,2), Val(size(pnts,1)+1))
+            @assert(size(pnts,1)+1 == qh_ptr.hull_dim)
+            voronoi_vertices, ridge_points, ridge_vertices, regions, point_region =
+                qh_get_voronoi_diagram(qh_ptr, size(pnts,2), Val(size(pnts,1)+1))
 
-        # max and min bounds
-        max_bound = maximum(pnts, dims=2)[:]
-        min_bound = minimum(pnts, dims=2)[:]
-        
-        #(F, C, at_inf) = qh_get_voronoi_pnts(qh_ptr, Val(hd))
-        new(qh_ptr, pnts, input_dim, voronoi_vertices, ridge_points, ridge_vertices,
-            regions, point_region, max_bound, min_bound)
+            # max and min bounds
+            max_bound = maximum(pnts, dims=2)[:]
+            min_bound = minimum(pnts, dims=2)[:]
+            
+            #(F, C, at_inf) = qh_get_voronoi_pnts(qh_ptr, Val(hd))
+            new(pnts, input_dim, voronoi_vertices, ridge_points, ridge_vertices,
+                regions, point_region, max_bound, min_bound)
+        end 
     end
 end
 
 # build Voronoi regions for a set of points
 struct HalfspaceIntersection
-    qh_ptr::Ptr{qhT}
     halfspaces::Matrix{QHcoordT}
     interior_point::Vector{QHrealT}
     ndim::QHintT
@@ -560,45 +557,46 @@ struct HalfspaceIntersection
     # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function HalfspaceIntersection(halfspaces::Matrix{QHcoordT}, interior_point::Vector{QHcoordT},
                                     qhull_options::Vector{String}=Vector{String}())
-        qh_ptr = qh_alloc_qh()
+        qhullptr() do qh_ptr 
 
-        # build Halfspace intersections
-        hs_mode = foldl((l,r)->l*","*string(r), interior_point[2:end], init="H"*string(interior_point[1]))
-        qhull_options = cat(hs_mode, qhull_options, dims=1)
-        #qhull_options = cat(["v", "Qbb"], qhull_options, dims=1) 
+            # build Halfspace intersections
+            hs_mode = foldl((l,r)->l*","*string(r), interior_point[2:end], init="H"*string(interior_point[1]))
+            qhull_options = cat(hs_mode, qhull_options, dims=1)
+            #qhull_options = cat(["v", "Qbb"], qhull_options, dims=1) 
+            
+            if size(halfspaces, 1)>=6
+                push!(qhull_options, "Qx")
+            end
+
+            # make options string
+            qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
+
+            # calculate halfspace intersections
+            res = qh_new_qhull(qh_ptr, halfspaces, qh_opts_str)
+
+            input_dim = qh_get_input_dim(qh_ptr)
+            hd = qh_get_hull_dim(qh_ptr)
+
+            dual_fcts, dual_eqs = qh_get_hull_facets(qh_ptr)
+            dual_pnts = qh_get_hull_points(qh_ptr)
+            
+            intersections = dual_eqs[1:end-1, :] ./ (-dual_eqs[1:end-1, :]) .+ interior_point
+            
+            if hd == 2
+                vertices = qh_get_extremes_2d(qh_ptr)
+            else
+                vertices = Matrix{QHcoordT}()
+            end
+
+            # calculate total area and volume
+            qh_getarea(qh_ptr, Val(hd))
+            area = qh_get_totarea(qh_ptr)
+            vol = qh_get_totvol(qh_ptr)
+
         
-        if size(halfspaces, 1)>=6
-            push!(qhull_options, "Qx")
-        end
-
-        # make options string
-        qh_opts_str = foldl((l,r)->l*" "*r, qhull_options)
-
-        # calculate halfspace intersections
-        res = qh_new_qhull(qh_ptr, halfspaces, qh_opts_str)
-
-        input_dim = qh_get_input_dim(qh_ptr)
-        hd = qh_get_hull_dim(qh_ptr)
-
-        dual_fcts, dual_eqs = qh_get_hull_facets(qh_ptr)
-        dual_pnts = qh_get_hull_points(qh_ptr)
-        
-        intersections = dual_eqs[1:end-1, :] ./ (-dual_eqs[1:end-1, :]) .+ interior_point
-        
-        if hd == 2
-            vertices = qh_get_extremes_2d(qh_ptr)
-        else
-            vertices = Matrix{QHcoordT}()
-        end
-
-        # calculate total area and volume
-        qh_getarea(qh_ptr, Val(hd))
-        area = qh_get_totarea(qh_ptr)
-        vol = qh_get_totvol(qh_ptr)
-
-        
-        new(qh_ptr, halfspaces, interior_point, hd, intersections, dual_pnts,
-            dual_fcts, vertices, dual_eqs, area, vol)
+            new(halfspaces, interior_point, hd, intersections, dual_pnts,
+                dual_fcts, vertices, dual_eqs, area, vol)
+        end 
     end
 end
 
@@ -609,8 +607,6 @@ mutable struct RidgesT
     ridge_points::Matrix{QHintT}
     ridge_vertices::Vector{Vector{QHintT}}
 end
-
-
 
 # calculate new convex hull from the given points and Qhull options
 function qh_new_qhull(qh::Ptr{qhT}, pnts::StridedMatrix{Float64}, opts::String)
@@ -1544,5 +1540,49 @@ function qh_get_hull_points(qh_ptr::Ptr{qhT})
 
     return points
 end
+
+function qhullfree(qh_ptr::Ptr{qhT})
+    # true here means free everything... 
+    ccall((:qh_freeqhull, qh_lib), Cvoid, (Ptr{qhT}, QHboolT), qh_ptr, true)
+
+    curlong = Ref{QHintT}()
+    totlong = Ref{QHintT}() 
+    ccall((:qh_memfreeshort, qh_lib), Cvoid, (Ptr{qhT}, Ref{QHintT}, Ref{QHintT}), 
+        qh_ptr, curlong, totlong)   
+    
+    ccall((:qh_free_qh, qh_lib), Cvoid, (Ptr{qhT}, ), qh_ptr)
+
+    if curlong[] != 0 || totlong[] != 0 
+        throw(ErrorException("Qhull did not free all memory (curlong=$(curlong[]), totlong=$(totlong[]))"))
+    end 
+
+    return nothing 
+end 
+
+"""
+    qhullptr(f::Function, args...; kwargs...)
+
+Apply the function f to the result of qhullptr(args...; kwargs...) and free the resulting memory.
+Please use this auto-freeing form unless there is a specific scenario that requires manual 
+memory management.  
+"""    
+function qhullptr(f::Function, args...; kwargs...)
+    qhptr = qhullptr(args...; kwargs...)
+    try
+        f(qhptr)
+    finally
+        qhullfree(qhptr)
+    end
+end
+
+"""
+    qhullptr([err_file=C_NULL])
+
+Allocate a pointer to a Qhull data structure. This will allocate memory that must be freed with 
+`qhullfree` when work with the pointer is complete. 
+"""
+function qhullptr(args...; kwargs...)
+    return qh_alloc_qh(args...; kwargs...)    
+end 
 
 end
