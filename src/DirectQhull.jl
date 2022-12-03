@@ -1305,9 +1305,9 @@ function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}; delaunay=false
                     # The array is always safe to resize
                     coplanar = cat(coplanar, zeros(QHintT, ncoplanar + 1, HD+1), dims=1)
                 end
-                coplanar[ncoplanar, 1] = qh_pointid(qh_ptr, point_ptr)
+                coplanar[ncoplanar, 1] = qh_pointid(qh_ptr, point_ptr) + 1 # +1 for 1-based indexing
                 coplanar[ncoplanar, 2] = id_map[facet.id]
-                coplanar[ncoplanar, 3] = qh_pointid(qh_ptr, vertex.point_ptr)
+                coplanar[ncoplanar, 3] = qh_pointid(qh_ptr, vertex.point_ptr) + 1 # +1 for 1-based indexing
                 ncoplanar += 1
             end
         end
@@ -1345,8 +1345,8 @@ function qh_visit_voronoi(qh_ptr::Ptr{qhT}, ridges::RidgesT, vertex_ptr::Ptr{QHv
     end
 
     # Record which points the ridge is between
-    point_1 = qh_pointid(qh_ptr, vertex.point_ptr)
-    point_2 = qh_pointid(qh_ptr, vertexA.point_ptr)
+    point_1 = qh_pointid(qh_ptr, vertex.point_ptr) + 1 # +1 for 1-based indexing
+    point_2 = qh_pointid(qh_ptr, vertexA.point_ptr) + 1 # +1 for 1-based indexing
 
     ridges.nridges += 1
     ridges.ridge_points[1, ridges.nridges] = point_1
@@ -1400,15 +1400,15 @@ function qh_get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) whe
         i = qh_pointid(qh_ptr, vertex.point_ptr)+1
         if i <= num_input_pnts
             # Qz results to one extra point
-            point_region[i] = length(regions)
+            point_region[i] = length(regions) + 1 # +1 for 1-based indexing
         end
         
         inf_seen = false
         cur_region = Vector{QHintT}()
 
         for neighbor in vertex.neighbors
-            i = neighbor.visitid - 1
-            if i == -1
+            i = neighbor.visitid
+            if i == 0
                 if !inf_seen
                     inf_seen = true
                 else
@@ -1456,8 +1456,8 @@ function qh_get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) whe
                     point = facet.coplanarset[k]
                     vertex = qh_nearvertex(qh_ptr, facet.self_ptr, point.self_ptr, dist)
                     
-                    i = qh_pointid(qh_ptr, point)
-                    j = qh_pointid(qh_ptr, vertex.point)
+                    i = qh_pointid(qh_ptr, point) + 1 # +1 for 1-based indexing
+                    j = qh_pointid(qh_ptr, vertex.point) + 1 # +1 for 1-based indexing
                     
                     if i <= num_input_pnts
                         # Qz can result to one extra point
