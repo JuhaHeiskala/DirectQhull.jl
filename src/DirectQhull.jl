@@ -1418,7 +1418,7 @@ function qh_get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) whe
             append!(cur_region, QHintT(i))
         end
 
-        if length(cur_region) == 1 && cur_region[1] == -1
+        if length(cur_region) == 1 && cur_region[1] == 0
             # report similarly as qvoronoi o
             cur_region = Vector{QHintT}()
         end
