@@ -358,6 +358,7 @@ end
 
 # Build convex hull from a set points
 struct ConvexHull
+    hull_dim::Int
     points::Matrix{QHcoordT}
     vertices::Vector{QHuintT}
     simplices::Matrix{QHuintT}
@@ -369,7 +370,7 @@ struct ConvexHull
     volume::QHrealT
     max_bound::Vector{QHrealT}
     min_bound::Vector{QHrealT}
-
+    
     # pnts are Matrix with dimensions (point_dim, num_points)
     # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
@@ -391,13 +392,13 @@ struct ConvexHull
             res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
             qh_triangulate(qh_ptr)
             
-            hd = qh_get_hull_dim(qh_ptr)
+            hull_dim = qh_get_hull_dim(qh_ptr)
 
             # collect convex hull points
-            # for some reason using hd from above in Val(hd) crashes Julia
+            # for some reason using hull_dim from above in Val(hull_dim) crashes Julia
             simplices = qh_get_convex_hull_pnts(qh_ptr, Val(size(pnts,1)))
 
-            if hd == 2
+            if hull_dim == 2
                 vertices = qh_get_extremes_2d(qh_ptr)
             else
                 vertices = unique(simplices)
@@ -427,7 +428,6 @@ struct ConvexHull
         end 
     end    
 end
-
 
 # Build convex hull from a set points
 struct Delaunay
@@ -786,30 +786,6 @@ end
 end
 
 
-function Base.getproperty(qh::ConvexHull, fld::Symbol)
-    if fld === :hull_dim
-        return qh_get_hull_dim(qh.qh_ptr)
-    elseif fld === :num_facets
-        return qh_get_num_facets(qh.qh_ptr)
-    elseif fld === :num_points
-        return qh_get_num_points(qh.qh_ptr)
-    elseif fld === :num_vertices
-        return qh_get_num_vertices(qh.qh_ptr)
-    elseif fld === :visit_id
-        return qh_get_visit_id(qh.qh_ptr)
-    elseif fld === :vertex_visit
-        return qh_get_vertex_visit(qh.qh_ptr)
-    elseif fld === :facet_list
-        # Hull dimension given to facet type so that hull dimension array size is known
-        return qh_get_facet_list(qh.qh_ptr, Val(qh.hull_dim))
-    elseif fld === :vertex_list
-        # Hull dimension given to facet type so that hull dimension array size is known
-        return qh_get_vertex_list(qh.qh_ptr, Val(qh.hull_dim))
-    else
-        return getfield(qh, fld)
-    end
-end
-
 function Base.getproperty(fct::QHfacetT{HD}, fld::Symbol) where HD
     if fld === :next
         ptr = getfield(fct, :next)
@@ -983,14 +959,14 @@ function qh_get_convex_hull_vertices(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
     vertex_ix = 1
     for vtx in vertex_list
         pnt_id = qh_pointid(qh_ptr, vtx.point_ptr)
-        vertices[vertex_ix] = pnt_id + 1
+        vertices[vertex_ix] = pnt_id + 1 # +1 for 1 based indexing in Julia
         vertex_ix+=1
     end
     
     return vertices
 end
 
-# get calculated voroin points as Julia array
+# get calculated voronoi points as Julia array
 function qh_get_voronoi_pnts(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
 
     qh_findgood_all(qh_ptr, Val(3))
