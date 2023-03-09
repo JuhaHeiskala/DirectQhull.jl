@@ -358,6 +358,7 @@ end
 
 # Build convex hull from a set points
 struct ConvexHull
+    hull_dim::Int
     points::Matrix{QHcoordT}
     vertices::Vector{QHuintT}
     simplices::Matrix{QHuintT}
@@ -369,7 +370,7 @@ struct ConvexHull
     volume::QHrealT
     max_bound::Vector{QHrealT}
     min_bound::Vector{QHrealT}
-
+    
     # pnts are Matrix with dimensions (point_dim, num_points)
     # qhull_options is a vector of individual qhull options, e.g. ["Qx", "Qc"]
     function ConvexHull(pnts::Matrix{QHcoordT}, qhull_options::Vector{String}=Vector{String}())
@@ -391,13 +392,13 @@ struct ConvexHull
             res = qh_new_qhull(qh_ptr, pnts, qh_opts_str)
             qh_triangulate(qh_ptr)
             
-            hd = qh_get_hull_dim(qh_ptr)
+            hull_dim = qh_get_hull_dim(qh_ptr)
 
             # collect convex hull points
-            # for some reason using hd from above in Val(hd) crashes Julia
+            # for some reason using hull_dim from above in Val(hull_dim) crashes Julia
             simplices = qh_get_convex_hull_pnts(qh_ptr, Val(size(pnts,1)))
 
-            if hd == 2
+            if hull_dim == 2
                 vertices = qh_get_extremes_2d(qh_ptr)
             else
                 vertices = unique(simplices)
@@ -427,7 +428,6 @@ struct ConvexHull
         end 
     end    
 end
-
 
 # Build convex hull from a set points
 struct Delaunay
@@ -786,30 +786,6 @@ end
 end
 
 
-function Base.getproperty(qh::ConvexHull, fld::Symbol)
-    if fld === :hull_dim
-        return qh_get_hull_dim(qh.qh_ptr)
-    elseif fld === :num_facets
-        return qh_get_num_facets(qh.qh_ptr)
-    elseif fld === :num_points
-        return qh_get_num_points(qh.qh_ptr)
-    elseif fld === :num_vertices
-        return qh_get_num_vertices(qh.qh_ptr)
-    elseif fld === :visit_id
-        return qh_get_visit_id(qh.qh_ptr)
-    elseif fld === :vertex_visit
-        return qh_get_vertex_visit(qh.qh_ptr)
-    elseif fld === :facet_list
-        # Hull dimension given to facet type so that hull dimension array size is known
-        return qh_get_facet_list(qh.qh_ptr, Val(qh.hull_dim))
-    elseif fld === :vertex_list
-        # Hull dimension given to facet type so that hull dimension array size is known
-        return qh_get_vertex_list(qh.qh_ptr, Val(qh.hull_dim))
-    else
-        return getfield(qh, fld)
-    end
-end
-
 function Base.getproperty(fct::QHfacetT{HD}, fld::Symbol) where HD
     if fld === :next
         ptr = getfield(fct, :next)
@@ -983,14 +959,14 @@ function qh_get_convex_hull_vertices(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
     vertex_ix = 1
     for vtx in vertex_list
         pnt_id = qh_pointid(qh_ptr, vtx.point_ptr)
-        vertices[vertex_ix] = pnt_id + 1
+        vertices[vertex_ix] = pnt_id + 1 # +1 for 1 based indexing in Julia
         vertex_ix+=1
     end
     
     return vertices
 end
 
-# get calculated voroin points as Julia array
+# get calculated voronoi points as Julia array
 function qh_get_voronoi_pnts(qh_ptr::Ptr{qhT}, ::Val{HD}) where HD
 
     qh_findgood_all(qh_ptr, Val(3))
@@ -1305,9 +1281,9 @@ function qh_get_simplex_facet_arrays(qh_ptr::Ptr{qhT}, ::Val{HD}; delaunay=false
                     # The array is always safe to resize
                     coplanar = cat(coplanar, zeros(QHintT, ncoplanar + 1, HD+1), dims=1)
                 end
-                coplanar[ncoplanar, 1] = qh_pointid(qh_ptr, point_ptr)
+                coplanar[ncoplanar, 1] = qh_pointid(qh_ptr, point_ptr) + 1 # +1 for 1-based indexing
                 coplanar[ncoplanar, 2] = id_map[facet.id]
-                coplanar[ncoplanar, 3] = qh_pointid(qh_ptr, vertex.point_ptr)
+                coplanar[ncoplanar, 3] = qh_pointid(qh_ptr, vertex.point_ptr) + 1 # +1 for 1-based indexing
                 ncoplanar += 1
             end
         end
@@ -1345,8 +1321,8 @@ function qh_visit_voronoi(qh_ptr::Ptr{qhT}, ridges::RidgesT, vertex_ptr::Ptr{QHv
     end
 
     # Record which points the ridge is between
-    point_1 = qh_pointid(qh_ptr, vertex.point_ptr)
-    point_2 = qh_pointid(qh_ptr, vertexA.point_ptr)
+    point_1 = qh_pointid(qh_ptr, vertex.point_ptr) + 1 # +1 for 1-based indexing
+    point_2 = qh_pointid(qh_ptr, vertexA.point_ptr) + 1 # +1 for 1-based indexing
 
     ridges.nridges += 1
     ridges.ridge_points[1, ridges.nridges] = point_1
@@ -1400,15 +1376,15 @@ function qh_get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) whe
         i = qh_pointid(qh_ptr, vertex.point_ptr)+1
         if i <= num_input_pnts
             # Qz results to one extra point
-            point_region[i] = length(regions)
+            point_region[i] = length(regions) + 1 # +1 for 1-based indexing
         end
         
         inf_seen = false
         cur_region = Vector{QHintT}()
 
         for neighbor in vertex.neighbors
-            i = neighbor.visitid - 1
-            if i == -1
+            i = neighbor.visitid
+            if i == 0
                 if !inf_seen
                     inf_seen = true
                 else
@@ -1418,7 +1394,7 @@ function qh_get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) whe
             append!(cur_region, QHintT(i))
         end
 
-        if length(cur_region) == 1 && cur_region[1] == -1
+        if length(cur_region) == 1 && cur_region[1] == 0
             # report similarly as qvoronoi o
             cur_region = Vector{QHintT}()
         end
@@ -1456,8 +1432,8 @@ function qh_get_voronoi_diagram(qh_ptr::Ptr{qhT}, num_input_pnts, ::Val{HD}) whe
                     point = facet.coplanarset[k]
                     vertex = qh_nearvertex(qh_ptr, facet.self_ptr, point.self_ptr, dist)
                     
-                    i = qh_pointid(qh_ptr, point)
-                    j = qh_pointid(qh_ptr, vertex.point)
+                    i = qh_pointid(qh_ptr, point) + 1 # +1 for 1-based indexing
+                    j = qh_pointid(qh_ptr, vertex.point) + 1 # +1 for 1-based indexing
                     
                     if i <= num_input_pnts
                         # Qz can result to one extra point
