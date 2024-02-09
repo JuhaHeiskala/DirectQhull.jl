@@ -1,7 +1,7 @@
 name = "DirectQhull"
 uuid = "c3f9d41a-afcb-471e-bc58-0b8d83bd86f4"
 authors = ["Juha Heiskala <juha.t.heiskala@iki.fi>"]
-version = "0.2.0"
+version = "0.2.1"
 
 [deps]
 Qhull_jll = "784f63db-0788-585a-bace-daefebcd302b"
